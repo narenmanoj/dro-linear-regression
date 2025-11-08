@@ -1,6 +1,39 @@
 import numpy as np
 import typing
 
+def _construct_row_map(matrices: np.array):
+  row_counts = [matrix.shape[0] for matrix in matrices]
+  cumulative_row_counts = np.cumsum([0] + row_counts)
+  row_index_map = {
+    i: range(cumulative_row_counts[i], cumulative_row_counts[i+1])
+    for i in range(len(matrices))
+  }
+  return row_index_map
+
+def leverage_scores(mat: np.array):
+  assert len(mat.shape) == 2, "Input must be a matrix. Received something with shape {mat.shape}"
+  inv = np.linalg.inv(mat.T @ mat)
+  return np.diag(mat @ inv @ mat.T)
+
+def block_lewis_weights(mat: np.array, p):
+  assert len(mat.shape) == 3, "Input must be a 3D numpy array. Received something with shape {mat.shape}"
+  index_map = _construct_row_map(mat)
+  A = np.concatenate(mat, axis=0)
+  m = mat.shape[0]
+  n = A.shape[0]
+  d = A.shape[1]
+  T = 3 * np.ln(m) # TODO: what's a constant that's good enough
+  b = d / m * np.ones(n)
+  b_vec = [b]
+  for t in range(T):
+    b_prev = b_vec[-1]
+    lev_scores = leverage_scores(np.diag(np.power(b_prev, 0.5 - 1.0 / p)) * A)
+
+    b_new = 0.0 # TODO: aggregate
+
+    b_vec.append(b_new)
+  return 1.1 * sum(b_vec) / T
+
 class DROLinearRegression:
   def __init__(self, 
                design: typing.List[np.array], 
@@ -46,7 +79,7 @@ class DROLinearRegression:
       # do one thing
       pass
     elif self.geometry_type == "Lewis":
-      # do one nother thing
+      # do one other thing
       pass
     return None
 
