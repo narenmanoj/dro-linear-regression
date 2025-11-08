@@ -5,10 +5,18 @@ def _construct_row_map(matrices: np.array):
   row_counts = [matrix.shape[0] for matrix in matrices]
   cumulative_row_counts = np.cumsum([0] + row_counts)
   row_index_map = {
-    i: range(cumulative_row_counts[i], cumulative_row_counts[i+1])
+    i: list(range(cumulative_row_counts[i], cumulative_row_counts[i + 1]))
     for i in range(len(matrices))
   }
   return row_index_map
+
+def _reverse_row_map(row_index_map):
+  # TODO: implement less stupidly
+  ans = []
+  for k in row_index_map.keys():
+    for vi in row_index_map[k]:
+      ans.append(k)
+  return np.array(ans)
 
 def leverage_scores(mat: np.array):
   assert len(mat.shape) == 2, "Input must be a matrix. Received something with shape {mat.shape}"
@@ -18,18 +26,20 @@ def leverage_scores(mat: np.array):
 def block_lewis_weights(mat: np.array, p):
   assert len(mat.shape) == 3, "Input must be a 3D numpy array. Received something with shape {mat.shape}"
   index_map = _construct_row_map(mat)
+  reverse_index_map = _reverse_row_map(index_map)
   A = np.concatenate(mat, axis=0)
   m = mat.shape[0]
   n = A.shape[0]
   d = A.shape[1]
-  T = 3 * np.ln(m) # TODO: what's a constant that's good enough
+  T = 3 * np.log(m) # TODO: what's a constant that's good enough
   b = d / m * np.ones(n)
   b_vec = [b]
-  for t in range(T):
+  for t in range(int(np.ceil(T))):
     b_prev = b_vec[-1]
-    lev_scores = leverage_scores(np.diag(np.power(b_prev, 0.5 - 1.0 / p)) * A)
+    lev_scores = leverage_scores(np.diag(np.power(b_prev, 0.5 - 1.0 / p)) @ A)
 
-    b_new = 0.0 # TODO: aggregate
+    new_weights = np.array([sum(lev_scores[j] for j in index_map[i]) for i in range(m)])
+    b_new = np.array([new_weights[reverse_index_map[i]] for i in reverse_index_map])
 
     b_vec.append(b_new)
   return 1.1 * sum(b_vec) / T
