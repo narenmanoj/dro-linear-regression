@@ -32,7 +32,7 @@ class DROLinearRegressionSolver:
     self.x = np.zeros(self.dim)
 
   def objective(self, input_point: np.array, powered: bool=False):
-    l2norms = np.linalg.norm(self.design @ input_point - response, axis=1)
+    l2norms = np.linalg.norm(self.design @ input_point - response, axis=1, ord=2)
     unpowered = np.linalg.norm(l2norms, ord=self.p)
     if powered:
       return np.power(unpowered, self.p)
