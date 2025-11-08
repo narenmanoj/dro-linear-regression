@@ -81,7 +81,7 @@ class DROLinearRegression:
     self.num_rows = self.stacked_design.shape[0]
 
     self.x = np.zeros(self.dim)
-    self.W = np.eye(self.num_rows)
+    self.w = np.ones(self.num_rows)
 
   def objective(self, input_point: np.array, powered: bool=False):
     l2norms = np.linalg.norm(self.design @ input_point - response, axis=1, ord=2)
@@ -97,8 +97,8 @@ class DROLinearRegression:
       pass
     elif self.geometry_type == "Lewis":
       # do one other thing
-      pass
-    return None
+      appended_response = np.concatenate([self.design, self.response[:, :, np.newaxis]], axis=2)
+      self.w = block_lewis_weights(appended_response)
 
   def initialize(self):
     # TODO: implement
