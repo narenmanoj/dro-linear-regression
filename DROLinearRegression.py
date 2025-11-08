@@ -44,7 +44,6 @@ def block_lewis_weights(mat: np.array | typing.List[np.array], p):
     lev_scores = lev_scores * d / sum(lev_scores)
     new_weights = np.array([sum(lev_scores[j] for j in index_map[i]) for i in range(m)])
     b_new = np.array([new_weights[reverse_index_map[i]] for i in range(len(reverse_index_map))])
-
     b_vec.append(b_new)
   return 1.1 * sum(b_vec) / T
 
@@ -72,8 +71,10 @@ class DROLinearRegression:
     else:
       trial_p = self.config["p"]
       try:
-        self.p = np.float(self.config["p"])
-        assert self.p >= 2.0
+        if trial_p != np.inf:
+          trial_p = float(trial_p)
+        assert trial_p >= 2.0 or trial_p == np.inf
+        self.p =  trial_p
       except Exception as e:
         print(f"Error in deciding p. Config p must be a floatable between 2 and np.inf. Received: {trial_p}")
     if "GeometryType" in self.config:
@@ -101,7 +102,12 @@ class DROLinearRegression:
     elif self.geometry_type == "Lewis":
       # do one other thing
       appended_response = np.concatenate([self.design, self.response[:, :, np.newaxis]], axis=2)
-      self.w = block_lewis_weights(appended_response)
+      self.w = block_lewis_weights(appended_response, self.p)
+
+  def warm_start(self):
+    raised = np.power(self.w, 0.5 - 1.0 / self.p)
+    W_powered_left = np.diag(raised)
+    self.x = solve_system(W_powered_left @ self.stacked_design, W_powered_left @ self.stacked_response)
 
   def step(self) -> np.array:
     # perform a single iteration of the algorithm and update the internal state variables
