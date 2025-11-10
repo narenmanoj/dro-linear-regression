@@ -7,89 +7,156 @@ Original file is located at
     https://colab.research.google.com/drive/1b-9ez2gS72H8mtdstFxhCESmGp5mOGdt
 """
 
+# ============================================================
+# Block A: Exact Robust Max-Group Loss via CVXPY
+# ============================================================
+
+import numpy as np
+
+try:
+    import cvxpy as cp
+except ImportError as e:
+    cp = None
+    print("[CVX] cvxpy is not installed. Install with `pip install cvxpy` to enable exact solver.")
+
+def solve_max_group_loss_cvxpy(A_groups, b_groups, verbose=False, solver=None):
+    """
+    Solve:
+        minimize_x max_i (1/n_i) ||A_i x - b_i||^2
+
+    via epigraph form:
+        minimize_{x,t} t
+        s.t. (1/n_i) ||A_i x - b_i||^2 <= t  for all i.
+
+    Returns:
+        x_star (np.ndarray), t_star (float)
+
+    Raises RuntimeError if cvxpy is unavailable or solve fails.
+    """
+    if cp is None:
+        raise RuntimeError("cvxpy not available; cannot solve exact robust problem.")
+
+    m = len(A_groups)
+    d = A_groups[0].shape[1]
+
+    x = cp.Variable(d)
+    t = cp.Variable()
+
+    constraints = []
+    for A_i, b_i in zip(A_groups, b_groups):
+        n_i = A_i.shape[0]
+        r_i = A_i @ x - b_i
+        constraints.append((1.0 / n_i) * cp.sum_squares(r_i) <= t)
+
+    prob = cp.Problem(cp.Minimize(t), constraints)
+
+    # Default solver choice: let cvxpy pick unless user passes one
+    prob.solve(solver=solver, verbose=verbose)
+
+    if prob.status not in ["optimal", "optimal_inaccurate"]:
+        raise RuntimeError(f"CVXPY robust solve status: {prob.status}")
+
+    x_star = x.value
+    t_star = t.value
+    if x_star is None or t_star is None or not np.isfinite(t_star):
+        raise RuntimeError("CVXPY robust solve did not return a valid solution.")
+
+    return np.asarray(x_star, dtype=float).ravel(), float(t_star)
+
+# ============================================================
+# Block B: Hard Instance Data Generation (Adversarial)
+# ============================================================
+
 import numpy as np
 import math
-import time
-import matplotlib.pyplot as plt
 
-# For reproducibility in Colab runs
 np.set_printoptions(precision=4, suppress=True)
 
-# ==============================
-# Data generation utilities
-# ==============================
+# ------------------ Data generator ------------------ #
 
-def generate_outlier_illcond_data(
-    m_total: int,
-    m_outlier: int,
-    d: int,
-    n_per_group: int,
-    noise_std: float,
-    cond_normal: float,
-    cond_outlier: float,
-    spread: float,
-    seed: int,
+def generate_hard_instance(
+    m_total=20,
+    m_outlier=3,
+    d=20,
+    n_per_group=200,
+    noise_std_normal=0.1,
+    noise_std_outlier=1e-3,
+    cond_normal=10.0,
+    cond_outlier=1e8,
+    spread_normal=3.0,
+    spread_outlier=60.0,
+    seed=0,
 ):
     """
-    Construct heterogeneous groups:
+    Adversarial heterogeneous instance designed so that:
+      - Most groups are benign and clustered near a common center x_center.
+      - A few outlier groups:
+          * have enormous curvature along distinct directions,
+          * have optima far away in those directions,
+          * have tiny noise (very sharp, high influence on max-loss),
+        so ERM does badly on max-group loss,
+        and first-order methods on the stacked problem are slowed by ill-conditioning.
 
-      - m_normal "normal" groups with moderate eigenvalues.
-      - m_outlier "outlier" groups with very large eigenvalues
-        in near-orthogonal directions.
-
-    This creates a stacked design matrix with large condition number,
-    while most groups individually remain benign.
+    Returns:
+      A_groups: list of (n_i, d)
+      b_groups: list of (n_i,)
     """
     rng = np.random.default_rng(seed)
     m_normal = m_total - m_outlier
+    assert m_normal > 0 and m_outlier > 0
 
     # Global orthonormal basis
     U, _ = np.linalg.qr(rng.standard_normal((d, d)))
-    k_out = min(m_outlier, d)
-    common_dims = max(d - k_out, 1)
 
     A_groups = []
     b_groups = []
 
-    # Normal groups
-    for _ in range(m_normal):
-        lambdas = np.ones(d)
-        # Moderate spread on a common subspace
-        logs = rng.uniform(0.0, math.log10(cond_normal), size=common_dims)
-        lambdas[:common_dims] = 10.0 ** logs
+    # Common reference center
+    x_center = rng.standard_normal(d)
 
+    # ----- Normal groups -----
+    for _ in range(m_normal):
+        # Moderate eigenvalues between 1 and cond_normal
+        logs = rng.uniform(0.0, math.log10(cond_normal), size=d)
+        lambdas = 10.0 ** logs
         Sigma = U @ np.diag(lambdas) @ U.T
-        L = np.linalg.cholesky(Sigma)
+        L = np.linalg.cholesky(Sigma + 1e-12 * np.eye(d))
 
         Z = rng.standard_normal((n_per_group, d))
         A_i = (Z @ L.T) / math.sqrt(d)
 
-        x_i_star = spread * rng.standard_normal(d)
-        noise = noise_std * rng.standard_normal(n_per_group)
+        # x_i* near x_center
+        x_i_star = x_center + spread_normal * rng.standard_normal(d)
+        noise = noise_std_normal * rng.standard_normal(n_per_group)
         b_i = A_i @ x_i_star + noise
 
         A_groups.append(A_i)
         b_groups.append(b_i)
 
-    # Outlier groups: huge eigenvalue in distinct directions
+    # ----- Outlier groups -----
+    # Use last m_outlier basis directions as special sharp directions
     for j in range(m_outlier):
-        lambdas = np.ones(d)
-        idx = d - 1 - j
-        lambdas[idx] = cond_outlier
+        v = U[:, d - 1 - j]  # special sharp direction
 
+        lambdas = np.ones(d)
+        lambdas[:] = 1.0
+        lambdas[d - 1 - j] = cond_outlier
+
+        # Mild variability on other coords
         logs = rng.uniform(0.0, 1.0, size=d)
         for t in range(d):
-            if t != idx and lambdas[t] == 1.0:
-                lambdas[t] = 10.0 ** logs[t]
+            if t != (d - 1 - j):
+                lambdas[t] *= 10.0 ** (0.2 * logs[t])
 
         Sigma = U @ np.diag(lambdas) @ U.T
-        L = np.linalg.cholesky(Sigma)
+        L = np.linalg.cholesky(Sigma + 1e-12 * np.eye(d))
 
         Z = rng.standard_normal((n_per_group, d))
         A_i = (Z @ L.T) / math.sqrt(d)
 
-        x_i_star = spread * rng.standard_normal(d)
-        noise = noise_std * rng.standard_normal(n_per_group)
+        # x_i* far along v
+        x_i_star = x_center + spread_outlier * v
+        noise = noise_std_outlier * rng.standard_normal(n_per_group)
         b_i = A_i @ x_i_star + noise
 
         A_groups.append(A_i)
@@ -97,15 +164,12 @@ def generate_outlier_illcond_data(
 
     return A_groups, b_groups
 
-
-# ==============================
-# Loss utilities
-# ==============================
+# ------------------ Loss utilities ------------------ #
 
 def group_losses(A_groups, b_groups, x):
-    # Mean squared error per group
+    # ell_i(x) = (1/n_i) ||A_i x - b_i||^2
     return np.array([
-        ((A_i @ x - b_i) @ (A_i @ x - b_i)) / len(b_i)
+        ((A_i @ x - b_i) @ (A_i @ x - b_i)) / float(len(b_i))
         for A_i, b_i in zip(A_groups, b_groups)
     ])
 
@@ -116,59 +180,71 @@ def solve_system_design(A, b):
     # ERM via pseudoinverse
     return np.linalg.pinv(A) @ b
 
+# ------------------ Generate instance & baselines ------------------ #
 
-# ==============================
-# Experiment configuration
-# ==============================
+# Small-ish but challenging by default
+m_total = 20
+m_outlier = 3
+d = 20
+n_per_group = 200
 
-# Heterogeneity controls
-m_total = 20         # total groups
-m_outlier = 3        # number of extreme groups
-d = 100              # dimension
-n_per_group = 200    # samples per group
-noise_std = 0.05
-cond_normal = 10.0   # typical group condition number scale
-cond_outlier = 1e8   # outlier group condition number scale
-spread = 5.0         # spread of group-specific optima
-seed = 0
-
-# Generate instance
-A_groups, b_groups = generate_outlier_illcond_data(
+A_groups, b_groups = generate_hard_instance(
     m_total=m_total,
     m_outlier=m_outlier,
     d=d,
     n_per_group=n_per_group,
-    noise_std=noise_std,
-    cond_normal=cond_normal,
-    cond_outlier=cond_outlier,
-    spread=spread,
-    seed=seed,
+    noise_std_normal=0.1,
+    noise_std_outlier=1e-3,
+    cond_normal=10.0,
+    cond_outlier=1e8,
+    spread_normal=3.0,
+    spread_outlier=60.0,
+    seed=0,
 )
 
 A_all = np.vstack(A_groups)
 b_all = np.concatenate(b_groups)
 
-# ERM solution (used as a reference baseline)
+# ERM solution
 x_erm = solve_system_design(A_all, b_all)
 F_erm = max_group_loss(A_groups, b_groups, x_erm)
 
-# Shared warm starts
-x_zero = np.zeros(d)
-rng_init = np.random.default_rng(1)
-x_rand = rng_init.standard_normal(d)  # single fixed random init used across blocks
+# Condition number of stacked Gram
+G = A_all.T @ A_all + 1e-12 * np.eye(d)
+evals = np.linalg.eigvalsh(G)
+cond_stack = float(evals.max() / max(evals.min(), 1e-18))
 
-print("Constructed instance:")
+print("Constructed hard adversarial instance:")
 print(f"  m_total      = {m_total}")
 print(f"  m_outlier    = {m_outlier}")
 print(f"  d            = {d}")
 print(f"  n_per_group  = {n_per_group}")
-print(f"  cond_normal  = {cond_normal}")
-print(f"  cond_outlier = {cond_outlier}")
+print(f"  cond(stack)  = {cond_stack:.2e}")
 print()
-print(f"ERM warm start max-loss: {F_erm:.6e}")
+print(f"ERM max-group loss: {F_erm:.6e}")
 
-# Default warm-start policy; each block can override but must call get_init
-DEFAULT_WARM_START = "rand"   # options: "erm", "zero", "rand"
+# Try to get exact robust optimum via CVXPY (Block A)
+F_opt = None
+x_opt = None
+if 'solve_max_group_loss_cvxpy' in globals():
+    try:
+        x_opt, F_opt = solve_max_group_loss_cvxpy(A_groups, b_groups, verbose=False)
+        print(f"Robust optimum max-group loss (CVXPY): {F_opt:.6e}")
+        gap = F_erm - F_opt
+        print(f"ERM - OPT gap: {gap:.6e}")
+    except Exception as e:
+        print("[CVX] Robust solve failed; proceeding without OPT. Error:", e)
+else:
+    print("[CVX] Exact solver not available; set F_opt manually or install cvxpy.")
+
+# ------------------ Shared inits & logging state ------------------ #
+
+# We now *recommend* ERM as the shared warm start (per theory).
+DEFAULT_WARM_START = "erm"   # options: "erm", "zero", "rand"
+
+x_zero = np.zeros(d)
+rng_init = np.random.default_rng(1)
+x_rand = rng_init.standard_normal(d)  # fixed random init (if you want it)
 
 def get_init(warm_start: str):
     if warm_start == "erm":
@@ -179,9 +255,11 @@ def get_init(warm_start: str):
         return x_rand.copy()
     raise ValueError("Unknown warm start type")
 
-# Placeholders to collect curves from each block
+# Global containers for curves / final values
 results_curves = {}
 results_final = {"ERM": F_erm}
+if F_opt is not None and np.isfinite(F_opt):
+    results_final["OPT"] = F_opt
 
 # ============================================================
 # Block 2: Subgradient Max-Loss (fixed + diminishing, tunable)
@@ -492,7 +570,7 @@ else:
     print("[Subgrad] No stable configuration found.")
 
 # ============================================================
-# Block 3: Smoothed-Max Gradient Descent (tuned smoothing)
+# Block 3: Smoothed-Max GD + Heavy-Ball + Nesterov (tuned)
 # ============================================================
 
 import numpy as np
@@ -518,24 +596,29 @@ def smooth_max_value_and_grad(A_groups, b_groups, x, beta, delta):
       where w_i is the softmax over psi_i / beta.
 
     Returns:
-      F_smooth (float), grad (ndarray)
+      F_smooth (float), grad (ndarray),
+      or (None, None) on numerical failure.
     """
     ell = group_losses(A_groups, b_groups, x)  # shape (m,)
     if not np.all(np.isfinite(ell)):
         return None, None
-
     if beta <= 0:
         return None, None
 
-    # Compute psi_i
+    # psi_i
     if delta > 0:
         s = np.sqrt(delta * delta + ell * ell)
+        if not np.all(np.isfinite(s)):
+            return None, None
         psi = s - delta
     else:
         psi = ell.copy()
 
     z = psi / beta
     z_max = np.max(z)
+    if not np.isfinite(z_max):
+        return None, None
+
     exp_z = np.exp(z - z_max)
     Z = exp_z.sum()
     if not np.isfinite(Z) or Z <= 0:
@@ -552,12 +635,16 @@ def smooth_max_value_and_grad(A_groups, b_groups, x, beta, delta):
         r_i = A_i @ x - b_i
         n_i = A_i.shape[0]
         g_i = (2.0 / n_i) * (A_i.T @ r_i)
+        if not np.all(np.isfinite(g_i)):
+            return None, None
         grads.append(g_i)
     grads = np.array(grads)  # (m, d)
 
     # Combine
     if delta > 0:
         s = np.sqrt(delta * delta + ell * ell)
+        if not np.all(np.isfinite(s)):
+            return None, None
         coeff = (ell / np.maximum(s, 1e-16)) * w
     else:
         coeff = w
@@ -569,7 +656,7 @@ def smooth_max_value_and_grad(A_groups, b_groups, x, beta, delta):
     return F_smooth, grad
 
 
-# ---------- Single run ----------
+# ---------- 1) Plain gradient descent ----------
 
 def run_smooth_gd(
     A_groups,
@@ -582,21 +669,6 @@ def run_smooth_gd(
     verbose=False,
     record_curve=False,
 ):
-    """
-    Gradient descent on F_smooth with fixed (beta, delta, step).
-
-    Failure conditions:
-      - non-finite F_smooth or grad,
-      - non-finite x,
-      - explosion of true max-loss by large factor.
-
-    If record_curve=False:
-      - only tracks scalar best_true and final x.
-    If record_curve=True:
-      - logs EVERY iteration t=0..T:
-        iters[t_index] = t
-        best_values[t_index] = best true max-loss up to iteration t.
-    """
     x = x0.copy()
     F_true_init = max_group_loss(A_groups, b_groups, x)
     best_true = F_true_init
@@ -613,35 +685,23 @@ def run_smooth_gd(
         F_sm, g = smooth_max_value_and_grad(A_groups, b_groups, x, beta, delta)
         if F_sm is None or g is None:
             if verbose:
-                print(
-                    f"[F_smooth GD] beta={beta:.2e},delta={delta:.2e},"
-                    f"step={step:.2e}, t={t}: bad F/grad."
-                )
+                print(f"[F_smooth GD] bad F/grad at t={t}")
             return None
 
         x = x - step * g
         if not np.all(np.isfinite(x)):
             if verbose:
-                print(
-                    f"[F_smooth GD] beta={beta:.2e},delta={delta:.2e},"
-                    f"step={step:.2e}, t={t}: x non-finite."
-                )
+                print(f"[F_smooth GD] x non-finite at t={t}")
             return None
 
         F_true = max_group_loss(A_groups, b_groups, x)
         if not np.isfinite(F_true):
             if verbose:
-                print(
-                    f"[F_smooth GD] beta={beta:.2e},delta={delta:.2e},"
-                    f"step={step:.2e}, t={t}: F_true non-finite."
-                )
+                print(f"[F_smooth GD] F_true non-finite at t={t}")
             return None
         if F_true > explode_threshold:
             if verbose:
-                print(
-                    f"[F_smooth GD] beta={beta:.2e},delta={delta:.2e},"
-                    f"step={step:.2e}, t={t}: F_true exploded {F_true:.3e}."
-                )
+                print(f"[F_smooth GD] F_true exploded {F_true:.3e} at t={t}")
             return None
 
         if F_true < best_true:
@@ -652,9 +712,7 @@ def run_smooth_gd(
             best_vals.append(best_true)
             if verbose:
                 print(
-                    f"[F_smooth GD] beta={beta:.2e},delta={delta:.2e},"
-                    f"step={step:.2e}, t={t}, "
-                    f"F_true={F_true:.6e}, best={best_true:.6e}"
+                    f"[F_smooth GD] t={t}, F_true={F_true:.6e}, best={best_true:.6e}"
                 )
 
     return {
@@ -665,9 +723,170 @@ def run_smooth_gd(
     }
 
 
-# ---------- Tuning ----------
+# ---------- 2) Heavy-ball momentum ----------
 
-def tune_smooth_gd(
+def run_smooth_heavy_ball(
+    A_groups,
+    b_groups,
+    x0,
+    beta,
+    delta,
+    step,
+    momentum,
+    T=100,
+    verbose=False,
+    record_curve=False,
+):
+    """
+    Heavy-ball:
+        v_{t+1} = momentum * v_t + step * g(x_t)
+        x_{t+1} = x_t - v_{t+1}
+    """
+    x = x0.copy()
+    v = np.zeros_like(x)
+
+    F_true_init = max_group_loss(A_groups, b_groups, x)
+    best_true = F_true_init
+    explode_threshold = 1e6 * max(F_true_init, 1.0)
+
+    if record_curve:
+        iters = [0]
+        best_vals = [best_true]
+    else:
+        iters = None
+        best_vals = None
+
+    for t in range(1, T + 1):
+        F_sm, g = smooth_max_value_and_grad(A_groups, b_groups, x, beta, delta)
+        if F_sm is None or g is None:
+            if verbose:
+                print(f"[HB] bad F/grad at t={t}")
+            return None
+
+        v = momentum * v + step * g
+        x = x - v
+
+        if not np.all(np.isfinite(x)) or not np.all(np.isfinite(v)):
+            if verbose:
+                print(f"[HB] non-finite x/v at t={t}")
+            return None
+
+        F_true = max_group_loss(A_groups, b_groups, x)
+        if not np.isfinite(F_true):
+            if verbose:
+                print(f"[HB] F_true non-finite at t={t}")
+            return None
+        if F_true > explode_threshold:
+            if verbose:
+                print(f"[HB] F_true exploded {F_true:.3e} at t={t}")
+            return None
+
+        if F_true < best_true:
+            best_true = F_true
+
+        if record_curve:
+            iters.append(t)
+            best_vals.append(best_true)
+            if verbose:
+                print(
+                    f"[HB] t={t}, F_true={F_true:.6e}, best={best_true:.6e}"
+                )
+
+    return {
+        "iters": iters,
+        "best_values": best_vals,
+        "x_final": x,
+        "best_true": best_true,
+    }
+
+
+# ---------- 3) Nesterov’s accelerated gradient ----------
+
+def run_smooth_nesterov(
+    A_groups,
+    b_groups,
+    x0,
+    beta,
+    delta,
+    step,
+    momentum,
+    T=100,
+    verbose=False,
+    record_curve=False,
+):
+    """
+    Nesterov (lookahead):
+
+        v_0 = 0
+        for t=1..T:
+            y_t = x_t - momentum * v_t
+            g_t = grad F_smooth(y_t)
+            v_{t+1} = momentum * v_t + step * g_t
+            x_{t+1} = x_t - v_{t+1}
+    """
+    x = x0.copy()
+    v = np.zeros_like(x)
+
+    F_true_init = max_group_loss(A_groups, b_groups, x)
+    best_true = F_true_init
+    explode_threshold = 1e6 * max(F_true_init, 1.0)
+
+    if record_curve:
+        iters = [0]
+        best_vals = [best_true]
+    else:
+        iters = None
+        best_vals = None
+
+    for t in range(1, T + 1):
+        y = x - momentum * v
+
+        F_sm, g = smooth_max_value_and_grad(A_groups, b_groups, y, beta, delta)
+        if F_sm is None or g is None:
+            if verbose:
+                print(f"[Nesterov] bad F/grad at t={t}")
+            return None
+
+        v = momentum * v + step * g
+        x = x - v
+
+        if not np.all(np.isfinite(x)) or not np.all(np.isfinite(v)):
+            if verbose:
+                print(f"[Nesterov] non-finite x/v at t={t}")
+            return None
+
+        F_true = max_group_loss(A_groups, b_groups, x)
+        if not np.isfinite(F_true):
+            if verbose:
+                print(f"[Nesterov] F_true non-finite at t={t}")
+            return None
+        if F_true > explode_threshold:
+            if verbose:
+                print(f"[Nesterov] F_true exploded {F_true:.3e} at t={t}")
+            return None
+
+        if F_true < best_true:
+            best_true = F_true
+
+        if record_curve:
+            iters.append(t)
+            best_vals.append(best_true)
+            if verbose:
+                print(
+                    f"[Nesterov] t={t}, F_true={F_true:.6e}, best={best_true:.6e}"
+                )
+
+    return {
+        "iters": iters,
+        "best_values": best_vals,
+        "x_final": x,
+        "best_true": best_true,
+    }
+
+
+# ---------- Tuning over all three variants ----------
+
+def tune_smooth_family(
     A_groups,
     b_groups,
     x0,
@@ -675,20 +894,31 @@ def tune_smooth_gd(
     verbose=False,
 ):
     """
-    Brute-force tuning over beta, delta (including 0), and step.
+    Tune beta, delta, and step/momentum for:
+      - plain GD,
+      - Heavy-ball,
+      - Nesterov.
 
-    Uses best true max-loss along each 0..T trajectory as the score.
-    During tuning:
-      - record_curve=False (low memory),
-      - prints one summary line per candidate.
+    Score for each candidate:
+      best TRUE max-loss along t = 0..T.
+
+    Returns:
+      best_cfg: {
+        "variant": "gd" | "heavy" | "nesterov",
+        "beta": ...,
+        "delta": ...,
+        "step": ...,
+        "momentum": ... (if applicable)
+      },
+      best_val
     """
     F_init = max_group_loss(A_groups, b_groups, x0)
-    print(f"[F_smooth GD tune] init true max-loss = {F_init:.6e}")
+    print(f"[F_smooth tune] init true max-loss = {F_init:.6e}")
 
-    # Instance-adaptive grids
     beta_rel = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1]
     delta_rel = [0.0, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3]
-    step_grid = np.logspace(-6, -2, 9)  # 1e-6 ... 1e-2
+    step_grid = np.logspace(-6, -2, 7)  # slightly slimmer: 1e-6 ... 1e-2
+    momentum_grid = [0.5, 0.7, 0.9]
 
     beta_grid = [br * F_init for br in beta_rel]
     delta_grid = [dr * F_init for dr in delta_rel]
@@ -700,17 +930,13 @@ def tune_smooth_gd(
         if beta <= 0:
             continue
         for delta in delta_grid:
+
+            # --- Plain GD ---
             for step in step_grid:
                 res = run_smooth_gd(
-                    A_groups,
-                    b_groups,
-                    x0,
-                    beta=beta,
-                    delta=delta,
-                    step=step,
-                    T=T,
-                    verbose=verbose,
-                    record_curve=False,
+                    A_groups, b_groups, x0,
+                    beta=beta, delta=delta, step=step,
+                    T=T, verbose=verbose, record_curve=False,
                 )
                 if res is None:
                     print(
@@ -718,74 +944,159 @@ def tune_smooth_gd(
                         f"delta={delta:.2e},step={step:.2e} -> FAILED"
                     )
                     continue
-
                 val = res["best_true"]
                 print(
                     f"[F_smooth GD tune] beta={beta:.2e},"
                     f"delta={delta:.2e},step={step:.2e} -> best={val:.6e}"
                 )
-
                 if np.isfinite(val) and val + 1e-9 < best_val:
                     best_val = val
                     best_cfg = {
+                        "variant": "gd",
                         "beta": float(beta),
                         "delta": float(delta),
                         "step": float(step),
                     }
 
+            # --- Heavy-ball ---
+            for step in step_grid:
+                for mom in momentum_grid:
+                    res = run_smooth_heavy_ball(
+                        A_groups, b_groups, x0,
+                        beta=beta, delta=delta,
+                        step=step, momentum=mom,
+                        T=T, verbose=verbose, record_curve=False,
+                    )
+                    if res is None:
+                        print(
+                            f"[HB tune] beta={beta:.2e},delta={delta:.2e},"
+                            f"step={step:.2e},mom={mom:.2f} -> FAILED"
+                        )
+                        continue
+                    val = res["best_true"]
+                    print(
+                        f"[HB tune] beta={beta:.2e},delta={delta:.2e},"
+                        f"step={step:.2e},mom={mom:.2f} -> best={val:.6e}"
+                    )
+                    if np.isfinite(val) and val + 1e-9 < best_val:
+                        best_val = val
+                        best_cfg = {
+                            "variant": "heavy",
+                            "beta": float(beta),
+                            "delta": float(delta),
+                            "step": float(step),
+                            "momentum": float(mom),
+                        }
+
+            # --- Nesterov ---
+            for step in step_grid:
+                for mom in momentum_grid:
+                    res = run_smooth_nesterov(
+                        A_groups, b_groups, x0,
+                        beta=beta, delta=delta,
+                        step=step, momentum=mom,
+                        T=T, verbose=verbose, record_curve=False,
+                    )
+                    if res is None:
+                        print(
+                            f"[Nesterov tune] beta={beta:.2e},delta={delta:.2e},"
+                            f"step={step:.2e},mom={mom:.2f} -> FAILED"
+                        )
+                        continue
+                    val = res["best_true"]
+                    print(
+                        f"[Nesterov tune] beta={beta:.2e},delta={delta:.2e},"
+                        f"step={step:.2e},mom={mom:.2f} -> best={val:.6e}"
+                    )
+                    if np.isfinite(val) and val + 1e-9 < best_val:
+                        best_val = val
+                        best_cfg = {
+                            "variant": "nesterov",
+                            "beta": float(beta),
+                            "delta": float(delta),
+                            "step": float(step),
+                            "momentum": float(mom),
+                        }
+
     return best_cfg, best_val
 
 
-# ---------- Run block and store best curve ----------
+# ---------- Run block and store best variant ----------
 
 warm_start_smooth = DEFAULT_WARM_START  # "erm", "zero", or "rand"
 x0_smooth = get_init(warm_start_smooth)
 
-print(f"\n[F_smooth GD] Using warm start = {warm_start_smooth}")
+print(f"\n[F_smooth family] Using warm start = {warm_start_smooth}")
 print("init true max-loss       =", max_group_loss(A_groups, b_groups, x0_smooth))
 
-smooth_cfg, smooth_best = tune_smooth_gd(
+smooth_cfg, smooth_best = tune_smooth_family(
     A_groups,
     b_groups,
     x0_smooth,
     T=100,
-    verbose=False,  # set True for detailed inner logs
+    verbose=False,  # flip to True if you want inner logs
 )
 
 if smooth_cfg is not None:
-    print(
-        "[F_smooth GD] Selected cfg:",
-        smooth_cfg,
-        "with best tuned value:",
-        smooth_best,
-    )
+    print("[F_smooth family] Selected cfg:", smooth_cfg, "with best tuned value:", smooth_best)
 
-    final_res = run_smooth_gd(
-        A_groups,
-        b_groups,
-        x0_smooth,
-        beta=smooth_cfg["beta"],
-        delta=smooth_cfg["delta"],
-        step=smooth_cfg["step"],
-        T=100,
-        verbose=False,
-        record_curve=True,  # log every iter 0..100
-    )
+    var = smooth_cfg["variant"]
+    if var == "gd":
+        final_res = run_smooth_gd(
+            A_groups,
+            b_groups,
+            x0_smooth,
+            beta=smooth_cfg["beta"],
+            delta=smooth_cfg["delta"],
+            step=smooth_cfg["step"],
+            T=100,
+            verbose=False,
+            record_curve=True,
+        )
+        label = "F_smooth GD (best)"
+    elif var == "heavy":
+        final_res = run_smooth_heavy_ball(
+            A_groups,
+            b_groups,
+            x0_smooth,
+            beta=smooth_cfg["beta"],
+            delta=smooth_cfg["delta"],
+            step=smooth_cfg["step"],
+            momentum=smooth_cfg["momentum"],
+            T=100,
+            verbose=False,
+            record_curve=True,
+        )
+        label = "F_smooth Heavy-Ball (best)"
+    else:  # "nesterov"
+        final_res = run_smooth_nesterov(
+            A_groups,
+            b_groups,
+            x0_smooth,
+            beta=smooth_cfg["beta"],
+            delta=smooth_cfg["delta"],
+            step=smooth_cfg["step"],
+            momentum=smooth_cfg["momentum"],
+            T=100,
+            verbose=False,
+            record_curve=True,
+        )
+        label = "F_smooth Nesterov (best)"
 
     if final_res is not None and final_res["iters"] is not None:
         x_final = final_res["x_final"]
         F_final = max_group_loss(A_groups, b_groups, x_final)
-        label = "F_smooth GD"
+
         results_curves[label] = {
             "iters": final_res["iters"],          # length 101: 0..100
             "best_values": final_res["best_values"],
         }
         results_final[label] = F_final
-        print(f"[F_smooth GD] final true max-loss = {F_final:.6e}")
+        print(f"[F_smooth family] final true max-loss = {F_final:.6e}")
     else:
-        print("[F_smooth GD] Final run failed; no curve recorded.")
+        print("[F_smooth family] Final run failed; no curve recorded.")
 else:
-    print("[F_smooth GD] No stable configuration found.")
+    print("[F_smooth family] No stable configuration found.")
 
 # ============================================================
 # Block: Interior-Point Method (IPM) for max-group loss
@@ -1180,18 +1491,18 @@ else:
     print("[IPM] No stable IPM configuration found.")
 
 # ============================================================
-# Block: Ball-Oracle Naive Geometry (Smoothed Max-Loss)
+# Block: Ball-Oracle Naive Geometry (Smoothed Max-Loss, Newton)
 # ============================================================
 
 import numpy as np
 
 # ------------------------------------------------------------
-# 1. Smoothed objective (shared by naive / Lewis versions)
+# 1. Smoothed objective (shared with Lewis version)
 # ------------------------------------------------------------
 
 def fsmooth_value(A_groups, b_groups, x, beta, delta):
     """
-    Smoothed approximation of max_i ell_i(x).
+    Smoothed approximation of max_i ell_i(x), ell_i(x) >= 0.
 
     If delta = 0:
         F_smooth(x) = beta * log sum_i exp(ell_i / beta)
@@ -1201,9 +1512,7 @@ def fsmooth_value(A_groups, b_groups, x, beta, delta):
         F_smooth(x) = beta * log sum_i exp(z_i)
     """
     ell = group_losses(A_groups, b_groups, x)
-    if not np.all(np.isfinite(ell)):
-        return np.inf
-    if beta <= 0:
+    if not np.all(np.isfinite(ell)) or beta <= 0:
         return np.inf
 
     if delta == 0.0:
@@ -1227,72 +1536,241 @@ def fsmooth_value(A_groups, b_groups, x, beta, delta):
     return float(val) if np.isfinite(val) else np.inf
 
 
-def fsmooth_grad(A_groups, b_groups, x, beta, delta):
+def fsmooth_grad_hess(A_groups, b_groups, x, beta, delta):
     """
-    Gradient of F_smooth w.r.t. x.
+    Gradient and Hessian of F_smooth(x).
 
-    If delta = 0:
-        grad = sum_i softmax_i(ell/beta) * grad ell_i(x)
+    Notation:
+      ell_i(x) = (1/n_i)||A_i x - b_i||^2
+      g_i      = grad ell_i(x)
+      H_i      = Hess ell_i(x) = (2/n_i) A_i^T A_i
 
-    If delta > 0:
-        grad = sum_i w_i * (ell_i / s_i) * grad ell_i(x),
-        where w_i is softmax over (s_i - delta)/beta and s_i = sqrt(delta^2 + ell_i^2).
+    For delta = 0:
+      F = beta log sum exp(ell_i / beta)
+      w_i = softmax(ell_i / beta)
+      grad F = sum_i w_i g_i
+      Hess F = sum_i w_i H_i
+               + (1/beta) sum_i w_i (g_i - ḡ)(g_i - ḡ)^T,  ḡ = sum_j w_j g_j
+
+    For delta > 0:
+      psi_i(ell_i) = s_i - delta,  s_i = sqrt(delta^2 + ell_i^2)
+      psi'_i = ell_i / s_i
+      psi''_i = delta^2 / s_i^3
+      z_i = psi_i / beta, w_i = softmax(z_i)
+
+      grad F = sum_i w_i psi'_i g_i
+      Hess F = sum_i w_i [ psi'_i H_i + psi''_i g_i g_i^T ]
+               + (1/beta) sum_i w_i (v_i - v̄)(v_i - v̄)^T,
+        where v_i = psi'_i g_i and v̄ = sum_j w_j v_j.
     """
     m = len(A_groups)
     d = A_groups[0].shape[1]
 
-    ell = group_losses(A_groups, b_groups, x)
-    if not np.all(np.isfinite(ell)) or beta <= 0:
-        return None
-
-    # Gradients of ell_i
+    ell = np.empty(m)
     g_arr = np.empty((m, d))
+    H_arr = []
+
     for idx, (A_i, b_i) in enumerate(zip(A_groups, b_groups)):
         r_i = A_i @ x - b_i
         n_i = A_i.shape[0]
+        ell_i = (r_i @ r_i) / n_i
+        if not np.isfinite(ell_i):
+            return None, None
         g_i = (2.0 / n_i) * (A_i.T @ r_i)
         if not np.all(np.isfinite(g_i)):
-            return None
+            return None, None
+        H_i = (2.0 / n_i) * (A_i.T @ A_i)
+
+        ell[idx] = ell_i
         g_arr[idx, :] = g_i
+        H_arr.append(H_i)
+
+    if beta <= 0:
+        return None, None
 
     if delta == 0.0:
+        # Softmax smoothing
         z = ell / beta
         z_max = np.max(z)
         if not np.isfinite(z_max):
-            return None
+            return None, None
         exp_z = np.exp(z - z_max)
         S = np.sum(exp_z)
         if S <= 0 or not np.isfinite(S):
-            return None
+            return None, None
         w = exp_z / S
-        grad = (w[:, None] * g_arr).sum(axis=0)
+
+        g_bar = (w[:, None] * g_arr).sum(axis=0)
+
+        # Gradient
+        grad = g_bar
+
+        # Hessian
+        H = np.zeros((d, d))
+        for i in range(m):
+            H += w[i] * H_arr[i]
+
+        # Softmax curvature term
+        for i in range(m):
+            diff = (g_arr[i] - g_bar).reshape(-1, 1)
+            H += (w[i] / beta) * (diff @ diff.T)
+
     else:
+        # Delta > 0: robust smoothing
         s = np.sqrt(delta * delta + ell * ell)
         if not np.all(np.isfinite(s)):
-            return None
-        z = (s - delta) / beta
+            return None, None
+
+        psi = s - delta
+        psi_prime = ell / np.maximum(s, 1e-16)
+        psi_second = (delta * delta) / np.maximum(s**3, 1e-16)
+
+        z = psi / beta
         z_max = np.max(z)
         if not np.isfinite(z_max):
-            return None
+            return None, None
         exp_z = np.exp(z - z_max)
         S = np.sum(exp_z)
         if S <= 0 or not np.isfinite(S):
-            return None
+            return None, None
         w = exp_z / S
 
-        ratio = np.zeros_like(ell)
-        mask = s > 0
-        ratio[mask] = ell[mask] / s[mask]
+        # v_i = psi'_i g_i
+        v_arr = psi_prime[:, None] * g_arr
+        v_bar = (w[:, None] * v_arr).sum(axis=0)
 
-        grad = (w[:, None] * ratio[:, None] * g_arr).sum(axis=0)
+        # Gradient
+        grad = v_bar
 
-    if not np.all(np.isfinite(grad)):
-        return None
-    return grad
+        # Hessian
+        H = np.zeros((d, d))
+        for i in range(m):
+            g_i = g_arr[i]
+            H_i = H_arr[i]
+            H += w[i] * (
+                psi_prime[i] * H_i
+                + psi_second[i] * np.outer(g_i, g_i)
+            )
+
+        # Softmax curvature term in v_i
+        for i in range(m):
+            diff = (v_arr[i] - v_bar).reshape(-1, 1)
+            H += (w[i] / beta) * (diff @ diff.T)
+
+    # Light regularization for numerical stability
+    if not np.all(np.isfinite(grad)) or not np.all(np.isfinite(H)):
+        return None, None
+
+    lam = 1e-10 * max(1.0, np.linalg.norm(H, ord=2))
+    H = H + lam * np.eye(d)
+
+    return grad, H
 
 
 # ------------------------------------------------------------
-# 2. Naive-geometry ball-oracle style method
+# 2. Euclidean ball Newton oracle
+# ------------------------------------------------------------
+
+def newton_ball_oracle_naive(
+    A_groups,
+    b_groups,
+    center,
+    R,
+    beta,
+    delta,
+    max_newton_steps=50,
+    tol=1e-6,
+    backtrack_beta=0.5,
+    backtrack_c=1e-4,
+    verbose=False,
+):
+    """
+    approximately solves:
+
+        min_x F_smooth(x)
+        s.t. ||x - center||_2 <= R
+
+    using damped Newton with projection onto the Euclidean ball.
+
+    Returns x_star or None on failure.
+    """
+    x = center.copy()
+
+    F = fsmooth_value(A_groups, b_groups, x, beta, delta)
+    if not np.isfinite(F):
+        if verbose:
+            print("[Naive oracle] Non-finite F at start.")
+        return None
+
+    for k in range(1, max_newton_steps + 1):
+        g, H = fsmooth_grad_hess(A_groups, b_groups, x, beta, delta)
+        if g is None or H is None:
+            if verbose:
+                print(f"[Naive oracle] Grad/Hess failure at step {k}.")
+            return None
+
+        g_norm = np.linalg.norm(g)
+        if g_norm <= tol * max(1.0, abs(F)):
+            # Good enough
+            return x
+
+        # Damped Newton step
+        # Additional regularization tied to gradient scale
+        lam = 1e-8 * max(1.0, g_norm)
+        H_reg = H + lam * np.eye(H.shape[0])
+
+        try:
+            dx = -np.linalg.solve(H_reg, g)
+        except np.linalg.LinAlgError:
+            if verbose:
+                print(f"[Naive oracle] Hessian solve failed at step {k}.")
+            return None
+
+        # Backtracking line search with feasibility projection
+        alpha = 1.0
+        descent = g @ dx
+        if descent > 0:
+            # If not a descent direction, flip or bail
+            dx = -dx
+            descent = g @ dx
+
+        success = False
+        for _ in range(60):
+            x_trial = x + alpha * dx
+
+            # Enforce ball constraint: project if outside
+            diff = x_trial - center
+            nrm = np.linalg.norm(diff)
+            if nrm > R:
+                if nrm == 0.0:
+                    x_trial = center.copy()
+                else:
+                    x_trial = center + (R / nrm) * diff
+
+            F_trial = fsmooth_value(A_groups, b_groups, x_trial, beta, delta)
+            if (
+                np.isfinite(F_trial)
+                and F_trial <= F + backtrack_c * alpha * descent
+            ):
+                success = True
+                break
+
+            alpha *= backtrack_beta
+
+        if not success:
+            # Could not find improving step; accept current x
+            if verbose:
+                print(f"[Naive oracle] Line search failed at step {k}.")
+            return x
+
+        x = x_trial
+        F = F_trial
+
+    return x
+
+
+# ------------------------------------------------------------
+# 3. Outer ball-oracle scheme in naive geometry
 # ------------------------------------------------------------
 
 def run_ball_oracle_naive(
@@ -1301,47 +1779,44 @@ def run_ball_oracle_naive(
     x0,
     beta,
     delta,
-    step,
     R0,
-    n_outer,
-    n_inner,
-    shrink=0.99,
-    max_iters=100,
+    n_outer=100,
+    R_decay=1.0,
+    max_newton_steps=50,
     verbose=False,
     record_curve=False,
 ):
     """
-    Naive geometry variant of our smoothed ball-oracle method.
+    Naive-geometry ball-oracle method:
 
-    - Uses Euclidean balls around current center.
-    - Outer loop k:
-        radius R_k, center = current x.
-        run n_inner gradient steps on F_smooth with projection.
-        update center <- x, R_k+1 = shrink * R_k.
-    - max_iters caps TOTAL gradient steps (for fairness).
+      For k = 1..n_outer:
+        - Call Newton ball-oracle on Euclidean ball B(center_k, R_k):
+              x_k = argmin_{||x-center_k|| <= R_k} F_smooth(x)
+        - center_{k+1} <- x_k
+        - R_{k+1} <- R_decay * R_k
 
-    Evaluation uses TRUE max-loss. F_smooth only guides steps.
+      We:
+        - use TRUE max-loss (max_i ell_i(x)) for evaluation,
+        - count ONLY OUTER ITERATIONS as "iterations" for curves.
 
     If record_curve=True:
-      - iters[0] = 0 with best_vals[0] = F_init
-      - then logs every gradient step (1..max_iters).
+      - iters[0] = 0, best_values[0] = F_true_init
+      - then one point per outer iteration (1..n_outer).
     """
-    d = A_groups[0].shape[1]
     x = x0.copy()
     center = x0.copy()
     R = float(R0)
 
-    F_init = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_init):
+    F_true_init = max_group_loss(A_groups, b_groups, x)
+    if not np.isfinite(F_true_init):
         if verbose:
-            print("[BallOracle naive] Non-finite init loss.")
+            print("[BallOracle naive] Non-finite init true loss.")
         return None
 
-    base_scale = max(F_init, 1.0)
+    base_scale = max(F_true_init, 1.0)
     explode_threshold = 1e6 * base_scale
 
-    best_true = F_init
-    F_true = F_init
+    best_true = F_true_init
 
     if record_curve:
         iters = [0]
@@ -1350,72 +1825,55 @@ def run_ball_oracle_naive(
         iters = None
         best_vals = None
 
-    it = 0
-    # Outer/inner loops with total step budget
     for k in range(1, n_outer + 1):
-        for j in range(1, n_inner + 1):
-            if it >= max_iters:
-                break
+        # One accurate ball-oracle solve
+        x_new = newton_ball_oracle_naive(
+            A_groups,
+            b_groups,
+            center=center,
+            R=R,
+            beta=beta,
+            delta=delta,
+            max_newton_steps=max_newton_steps,
+            verbose=verbose,
+        )
+        if x_new is None or not np.all(np.isfinite(x_new)):
+            if verbose:
+                print(f"[BallOracle naive] Oracle failed at outer iter {k}.")
+            return None
 
-            it += 1
-
-            g = fsmooth_grad(A_groups, b_groups, x, beta, delta)
-            if g is None:
-                if verbose:
-                    print(
-                        f"[BallOracle naive] beta={beta:.2e},delta={delta:.2e},"
-                        f"step={step:.2e}: grad non-finite at outer={k}, inner={j}"
-                    )
-                return None
-
-            x_new = x - step * g
-            if not np.all(np.isfinite(x_new)):
-                if verbose:
-                    print(
-                        f"[BallOracle naive] beta={beta:.2e},delta={delta:.2e},"
-                        f"step={step:.2e}: x non-finite at iter {it}"
-                    )
-                return None
-
-            # Project onto Euclidean ball around current center
-            diff = x_new - center
-            norm_diff = np.linalg.norm(diff)
-            if norm_diff > R:
-                x_new = center + (R / max(norm_diff, 1e-16)) * diff
-
-            x = x_new
-
-            F_true = max_group_loss(A_groups, b_groups, x)
-            if not np.isfinite(F_true):
-                if verbose:
-                    print(
-                        f"[BallOracle naive] Non-finite F_true at iter {it}: {F_true}"
-                    )
-                return None
-            if F_true > explode_threshold:
-                if verbose:
-                    print(
-                        f"[BallOracle naive] Explosion at iter {it}: "
-                        f"F_true={F_true:.3e}"
-                    )
-                return None
-
-            if F_true < best_true:
-                best_true = F_true
-
-            if record_curve:
-                iters.append(it)
-                best_vals.append(best_true)
-                if verbose:
-                    print(
-                        f"[BallOracle naive] it={it}, F_true={F_true:.6e}, "
-                        f"best={best_true:.6e}, R={R:.3e}"
-                    )
-
-        # End of outer loop: update center, shrink radius
+        x = x_new
         center = x.copy()
-        R *= shrink
-        if R <= 0 or it >= max_iters:
+
+        # Evaluate true max-loss
+        F_true = max_group_loss(A_groups, b_groups, x)
+        if not np.isfinite(F_true):
+            if verbose:
+                print(f"[BallOracle naive] Non-finite true loss at outer {k}.")
+            return None
+        if F_true > explode_threshold:
+            if verbose:
+                print(
+                    f"[BallOracle naive] Explosion at outer {k}: "
+                    f"F_true={F_true:.3e}"
+                )
+            return None
+
+        if F_true < best_true:
+            best_true = F_true
+
+        if record_curve:
+            iters.append(k)
+            best_vals.append(best_true)
+            if verbose:
+                print(
+                    f"[BallOracle naive] outer={k}, "
+                    f"F_true={F_true:.6e}, best={best_true:.6e}, R={R:.3e}"
+                )
+
+        # Update radius
+        R *= R_decay
+        if R <= 0:
             break
 
     return {
@@ -1428,40 +1886,40 @@ def run_ball_oracle_naive(
 
 
 # ------------------------------------------------------------
-# 3. Tuning for naive-geometry ball-oracle
+# 4. Tuning for naive-geometry Newton ball-oracle
 # ------------------------------------------------------------
 
 def tune_ball_oracle_naive(
     A_groups,
     b_groups,
     x0,
-    max_iters=100,
+    n_outer=100,
     verbose=False,
 ):
     """
-    Grid search over (beta, delta, step, R0, n_outer, n_inner, shrink).
+    Tune over (beta, delta, R0, R_decay) for the naive Newton ball-oracle.
 
-    - Uses x0 as given (no randomness).
-    - Enforces n_outer * n_inner >= max_iters so each config
-      can use the full iteration budget.
-    - Score: best TRUE max-loss along trajectory (0..max_iters).
+    Uses:
+      - shared x0 (no new randomness),
+      - n_outer outer iterations (each is one oracle call),
+      - criterion: best TRUE max-loss along outer iterations.
     """
     F_init = max_group_loss(A_groups, b_groups, x0)
     print(f"[BallOracle naive tune] init true max-loss = {F_init:.6e}")
 
     base = max(F_init, 1.0)
 
-    beta_grid = base * np.logspace(-3, 0, 5)   # [1e-3, ..., 1] * base
-    delta_multipliers = [0.0, 1e-2, 1e-1]      # relative to beta
-    step_grid = np.logspace(-8, -5, 4)
+    # Instance-adaptive grids (kept modest to avoid overkill)
+    beta_grid = base * np.logspace(-3, 0, 5)      # [1e-3, ..., 1] * base
+    delta_multipliers = [0.0, 1e-3, 1e-2]         # small robust deltas
+    R0_grid = []
 
     xnorm = float(np.linalg.norm(x0))
     base_R = xnorm if xnorm > 0 else 1.0
-    R_grid = [0.5 * base_R, 1.0 * base_R, 2.0 * base_R]
+    # A few plausible starting radii
+    R0_grid.extend([0.5 * base_R, 1.0 * base_R, 2.0 * base_R])
 
-    n_outer_list = [5, 10]
-    n_inner_list = [5, 10]
-    shrink_list = [0.99, 0.95]
+    R_decay_grid = [1.0, 0.999, 0.99]
 
     best_cfg = None
     best_val = float("inf")
@@ -1469,66 +1927,53 @@ def tune_ball_oracle_naive(
     for beta in beta_grid:
         for dm in delta_multipliers:
             delta = dm * beta
-            for step in step_grid:
-                for R0 in R_grid:
-                    for n_outer in n_outer_list:
-                        for n_inner in n_inner_list:
-                            # Require enough steps to fill budget
-                            if n_outer * n_inner < max_iters:
-                                continue
-                            for shrink in shrink_list:
-                                res = run_ball_oracle_naive(
-                                    A_groups,
-                                    b_groups,
-                                    x0,
-                                    beta=beta,
-                                    delta=delta,
-                                    step=step,
-                                    R0=R0,
-                                    n_outer=n_outer,
-                                    n_inner=n_inner,
-                                    shrink=shrink,
-                                    max_iters=max_iters,
-                                    verbose=False,
-                                    record_curve=False,
-                                )
-                                if res is None:
-                                    print(
-                                        "[BallOracle naive tune] "
-                                        f"beta={beta:.2e},delta={delta:.2e},"
-                                        f"step={step:.2e},R0={R0:.2e},"
-                                        f"outer={n_outer},inner={n_inner},"
-                                        f"shrink={shrink:.2f} -> FAILED"
-                                    )
-                                    continue
+            for R0 in R0_grid:
+                for R_decay in R_decay_grid:
+                    res = run_ball_oracle_naive(
+                        A_groups,
+                        b_groups,
+                        x0,
+                        beta=beta,
+                        delta=delta,
+                        R0=R0,
+                        n_outer=n_outer,
+                        R_decay=R_decay,
+                        max_newton_steps=50,
+                        verbose=False,
+                        record_curve=False,
+                    )
+                    if res is None:
+                        if verbose:
+                            print(
+                                "[BallOracle naive tune] "
+                                f"beta={beta:.2e},delta={delta:.2e},"
+                                f"R0={R0:.2e},R_decay={R_decay:.3f} -> FAILED"
+                            )
+                        continue
 
-                                val = res["best_true"]
-                                print(
-                                    "[BallOracle naive tune] "
-                                    f"beta={beta:.2e},delta={delta:.2e},"
-                                    f"step={step:.2e},R0={R0:.2e},"
-                                    f"outer={n_outer},inner={n_inner},"
-                                    f"shrink={shrink:.2f} "
-                                    f"-> best={val:.6e}"
-                                )
+                    val = res["best_true"]
+                    print(
+                        "[BallOracle naive tune] "
+                        f"beta={beta:.2e},delta={delta:.2e},"
+                        f"R0={R0:.2e},R_decay={R_decay:.3f} "
+                        f"-> best={val:.6e}"
+                    )
 
-                                if np.isfinite(val) and val + 1e-9 < best_val:
-                                    best_val = val
-                                    best_cfg = {
-                                        "beta": float(beta),
-                                        "delta": float(delta),
-                                        "step": float(step),
-                                        "R0": float(R0),
-                                        "n_outer": int(n_outer),
-                                        "n_inner": int(n_inner),
-                                        "shrink": float(shrink),
-                                    }
+                    if np.isfinite(val) and val + 1e-9 < best_val:
+                        best_val = val
+                        best_cfg = {
+                            "beta": float(beta),
+                            "delta": float(delta),
+                            "R0": float(R0),
+                            "R_decay": float(R_decay),
+                            "n_outer": int(n_outer),
+                        }
 
     return best_cfg, best_val
 
 
 # ------------------------------------------------------------
-# 4. Run naive-geometry method with shared-style warm start
+# 5. Run naive-geometry method with shared-style warm start
 # ------------------------------------------------------------
 
 warm_start_naive = DEFAULT_WARM_START  # "erm", "zero", or "rand"
@@ -1541,7 +1986,7 @@ naive_cfg, naive_best = tune_ball_oracle_naive(
     A_groups,
     b_groups,
     x0_naive,
-    max_iters=100,
+    n_outer=100,
     verbose=False,
 )
 
@@ -1559,14 +2004,12 @@ if naive_cfg is not None:
         x0_naive,
         beta=naive_cfg["beta"],
         delta=naive_cfg["delta"],
-        step=naive_cfg["step"],
         R0=naive_cfg["R0"],
         n_outer=naive_cfg["n_outer"],
-        n_inner=naive_cfg["n_inner"],
-        shrink=naive_cfg["shrink"],
-        max_iters=100,
+        R_decay=naive_cfg["R_decay"],
+        max_newton_steps=50,
         verbose=False,
-        record_curve=True,  # log every iter 0..100
+        record_curve=True,  # logs outer its 0..n_outer
     )
 
     if final_naive is not None and final_naive["iters"] is not None:
@@ -1587,18 +2030,18 @@ else:
     print("[BallOracle naive] No stable configuration found.")
 
 # ============================================================
-# Block: Ball-Oracle Lewis Geometry (Smoothed Max-Loss)
+# Block: Ball-Oracle Lewis Geometry (Smoothed Max-Loss, Newton)
 # ============================================================
 
 import numpy as np
 
 # ------------------------------------------------------------
-# 1. Smoothed objective (shared with naive version)
+# 1. Smoothed objective (same as naive block)
 # ------------------------------------------------------------
 
 def fsmooth_value(A_groups, b_groups, x, beta, delta):
     """
-    Smoothed approximation of max_i ell_i(x).
+    Smoothed approximation of max_i ell_i(x), ell_i(x) >= 0.
 
     If delta = 0:
         F_smooth(x) = beta * log sum_i exp(ell_i / beta)
@@ -1608,9 +2051,7 @@ def fsmooth_value(A_groups, b_groups, x, beta, delta):
         F_smooth(x) = beta * log sum_i exp(z_i)
     """
     ell = group_losses(A_groups, b_groups, x)
-    if not np.all(np.isfinite(ell)):
-        return np.inf
-    if beta <= 0:
+    if not np.all(np.isfinite(ell)) or beta <= 0:
         return np.inf
 
     if delta == 0.0:
@@ -1634,115 +2075,171 @@ def fsmooth_value(A_groups, b_groups, x, beta, delta):
     return float(val) if np.isfinite(val) else np.inf
 
 
-def fsmooth_grad(A_groups, b_groups, x, beta, delta):
+# We assume fsmooth_grad_hess(A_groups, b_groups, x, beta, delta)
+# is already defined in the Naive Newton block and shared globally.
+# If not, reuse exactly that implementation here.
+
+
+# ------------------------------------------------------------
+# 2. Block Lewis weights on [A_i | b_i], p = ∞
+# ------------------------------------------------------------
+
+def _construct_row_map_from_blocks(blocks):
     """
-    Gradient of F_smooth w.r.t. x.
-
-    If delta = 0:
-        grad = sum_i softmax_i(ell/beta) * grad ell_i(x)
-
-    If delta > 0:
-        grad = sum_i w_i * (ell_i / s_i) * grad ell_i(x),
-        where w_i is softmax over (s_i - delta)/beta and s_i = sqrt(delta^2 + ell_i^2).
+    blocks: list of 2D arrays, each (n_i, d').
+    Returns dict: i -> list of global row indices in stacked matrix.
     """
-    m = len(A_groups)
-    d = A_groups[0].shape[1]
+    row_counts = [B.shape[0] for B in blocks]
+    cumulative = np.cumsum([0] + row_counts)
+    return {
+        i: list(range(cumulative[i], cumulative[i + 1]))
+        for i in range(len(blocks))
+    }
 
-    ell = group_losses(A_groups, b_groups, x)
-    if not np.all(np.isfinite(ell)) or beta <= 0:
-        return None
 
-    # Gradients of ell_i
-    g_arr = np.empty((m, d))
-    for idx, (A_i, b_i) in enumerate(zip(A_groups, b_groups)):
-        r_i = A_i @ x - b_i
-        n_i = A_i.shape[0]
-        g_i = (2.0 / n_i) * (A_i.T @ r_i)
-        if not np.all(np.isfinite(g_i)):
-            return None
-        g_arr[idx, :] = g_i
+def _reverse_row_map(row_index_map):
+    """
+    Reverse map: for each global row index j, gives its block index.
+    Assumes keys are 0..m-1 in order.
+    """
+    rows_to_block = []
+    for i in range(len(row_index_map)):
+        rows_to_block.extend([i] * len(row_index_map[i]))
+    return np.array(rows_to_block, dtype=int)
 
-    if delta == 0.0:
-        z = ell / beta
-        z_max = np.max(z)
-        if not np.isfinite(z_max):
-            return None
-        exp_z = np.exp(z - z_max)
-        S = np.sum(exp_z)
-        if S <= 0 or not np.isfinite(S):
-            return None
-        w = exp_z / S
-        grad = (w[:, None] * g_arr).sum(axis=0)
+
+def leverage_scores(M):
+    """
+    Exact leverage scores of rows of M:
+        lev_i = e_i^T M (M^T M)^(-1) M^T e_i.
+    """
+    n, d = M.shape
+    G = M.T @ M + 1e-12 * np.eye(d)
+    G_inv = np.linalg.inv(G)
+    # lev_i = row_i G_inv row_i^T
+    return np.einsum("ij,jk,ik->i", M, G_inv, M)
+
+
+def block_lewis_weights_from_blocks(blocks, p=np.inf, fudge=1.1):
+    """
+    Approximate block Lewis weights on [A_i | b_i].
+
+    blocks: list of (n_i, d') arrays, one per group.
+    Returns w \in R^{sum_i n_i}: per-row weights.
+
+    Matches the iterative scheme from your collaborator's code.
+    """
+    m = len(blocks)
+    A = np.vstack(blocks)
+    n, d = A.shape
+
+    index_map = _construct_row_map_from_blocks(blocks)
+    rev = _reverse_row_map(index_map)
+
+    # Effective p
+    if p == np.inf:
+        p_eff = np.inf
     else:
-        s = np.sqrt(delta * delta + ell * ell)
-        if not np.all(np.isfinite(s)):
-            return None
-        z = (s - delta) / beta
-        z_max = np.max(z)
-        if not np.isfinite(z_max):
-            return None
-        exp_z = np.exp(z - z_max)
-        S = np.sum(exp_z)
-        if S <= 0 or not np.isfinite(S):
-            return None
-        w = exp_z / S
+        p_eff = float(p)
 
-        ratio = np.zeros_like(ell)
-        mask = s > 0
-        ratio[mask] = ell[mask] / s[mask]
+    # Number of iterations ~ O(log m)
+    T = int(np.ceil(3 * np.log(max(m, 2))))
 
-        grad = (w[:, None] * ratio[:, None] * g_arr).sum(axis=0)
+    # Initialize so average block weight ~ d/m
+    b0 = (d / m) * np.ones(n)
+    b_hist = [b0]
 
-    if not np.all(np.isfinite(grad)):
-        return None
-    return grad
+    for _ in range(T):
+        b_prev = b_hist[-1]
+
+        if p_eff == np.inf:
+            expo = 0.5          # 0.5 - 1/p
+        else:
+            expo = 0.5 - 1.0 / p_eff
+
+        D = np.diag(np.power(np.maximum(b_prev, 1e-16), expo))
+        lev = leverage_scores(D @ A)
+
+        # Normalize leverages to sum to d
+        lev_sum = max(lev.sum(), 1e-16)
+        lev = lev * (d / lev_sum)
+
+        # Aggregate per block
+        block_w = np.array([
+            lev[idxs].sum()
+            for i, idxs in index_map.items()
+        ])
+
+        # Broadcast back to rows
+        b_new = block_w[rev]
+        b_hist.append(b_new)
+
+    # Following collaborator: average (over T, not T+1) and fudge
+    w = fudge * sum(b_hist) / max(T, 1)
+    return np.maximum(w, 1e-16)
 
 
-# ------------------------------------------------------------
-# 2. Lewis-style geometry: build ellipsoidal norm
-# ------------------------------------------------------------
-
-def build_lewis_geometry(A_groups, eps=1e-6):
+def build_lewis_geometry(A_groups, b_groups, p=np.inf, eps=1e-6):
     """
-    Build a simple Lewis-style SPD matrix M from all groups.
+    Construct Lewis-style SPD matrix M from block Lewis weights on [A_i | b_i].
 
-    We approximate with:
-        M ≈ sum_i (2/n_i) A_i^T A_i + eps I
+    Steps:
+      - Form blocks B_i = [A_i | b_i].
+      - Compute per-row weights w via block_lewis_weights_from_blocks.
+      - For general p:
+            w_geom = w^{1 - 2/p}.
+        For p = ∞, exponent = 1, so w_geom = w.
+      - Set:
+            M = A^T diag(w_geom) A + eps I.
+      - Return L such that M = L^T L (Cholesky).
 
-    Return its Cholesky factor L such that:
-        M = L^T L.
-
-    The M-norm is then ||x||_M = ||L x||_2.
+    The Lewis norm is ||x||_M = ||L x||_2.
     """
-    d = A_groups[0].shape[1]
-    M = np.zeros((d, d))
-    for A_i, b_i in zip(A_groups, b_groups):
-        n_i = A_i.shape[0]
-        M += (2.0 / n_i) * (A_i.T @ A_i)
-    M += eps * np.eye(d)
+    # Form [A_i | b_i] blocks
+    blocks = [np.hstack([A_i, b_i[:, None]]) for A_i, b_i in zip(A_groups, b_groups)]
 
-    # Cholesky for stability; if it fails, bump eps
+    # Per-row Lewis weights for blocks
+    w = block_lewis_weights_from_blocks(blocks, p=p)  # length = sum_i n_i
+
+    # Stack A for geometry
+    A = np.vstack(A_groups)
+    n, d = A.shape
+    if len(w) != n:
+        raise ValueError("Lewis weights length mismatch with stacked A.")
+
+    if p == np.inf:
+        w_geom = w  # exponent 1 - 2/p = 1
+    else:
+        w_geom = np.power(w, 1.0 - 2.0 / float(p))
+
+    W = np.diag(w_geom)
+    M = A.T @ W @ A + eps * np.eye(d)
+
+    # Robust Cholesky
     for _ in range(5):
         try:
             L = np.linalg.cholesky(M)
             return L
         except np.linalg.LinAlgError:
             eps *= 10.0
-            M += (eps) * np.eye(d)
+            M += eps * np.eye(d)
 
-    # If still failing, fall back to identity geometry
+    # If still failing, fall back (rare / pathological)
     return np.eye(d)
 
 
+# ------------------------------------------------------------
+# 3. Lewis-norm ball projection
+# ------------------------------------------------------------
+
 def project_onto_lewis_ball(x, center, R, L):
     """
-    Project x onto the ellipsoid:
-        { z : ||z - center||_M <= R },  M = L^T L.
+    Project x onto { z : ||z - center||_M <= R }, M = L^T L.
 
     Using:
-        y = L (x - center)
-        if ||y|| <= R: no change
-        else: z = center + L^{-1} (R * y / ||y||)
+      y = L (x - center)
+      if ||y||_2 <= R: return x
+      else: z = center + L^{-1} (R * y / ||y||_2)
     """
     diff = x - center
     y = L @ diff
@@ -1752,13 +2249,103 @@ def project_onto_lewis_ball(x, center, R, L):
     if norm_y == 0.0:
         return center.copy()
     scale = R / norm_y
-    # Solve L u = scale * y  -> u = L^{-1} (scale*y)
     u = np.linalg.solve(L, scale * y)
     return center + u
 
 
 # ------------------------------------------------------------
-# 3. Lewis-geometry ball-oracle method
+# 4. Newton-based Lewis ball oracle
+# ------------------------------------------------------------
+
+def newton_ball_oracle_lewis(
+    A_groups,
+    b_groups,
+    center,
+    R,
+    beta,
+    delta,
+    L,
+    max_newton_steps=50,
+    tol=1e-6,
+    backtrack_beta=0.5,
+    backtrack_c=1e-4,
+    verbose=False,
+):
+    """
+    Approximately solve:
+
+        min_x F_smooth(x)
+        s.t. ||x - center||_M <= R,   M = L^T L
+
+    via damped Newton with projection onto the Lewis ball.
+    Uses fsmooth_grad_hess (shared with naive block).
+    """
+    x = center.copy()
+
+    F = fsmooth_value(A_groups, b_groups, x, beta, delta)
+    if not np.isfinite(F):
+        if verbose:
+            print("[Lewis oracle] Non-finite F at start.")
+        return None
+
+    for k in range(1, max_newton_steps + 1):
+        g, H = fsmooth_grad_hess(A_groups, b_groups, x, beta, delta)
+        if g is None or H is None:
+            if verbose:
+                print(f"[Lewis oracle] Grad/Hess failure at step {k}.")
+            return None
+
+        g_norm = np.linalg.norm(g)
+        if g_norm <= tol * max(1.0, abs(F)):
+            return x
+
+        # Regularize Hessian
+        lam = 1e-8 * max(1.0, g_norm)
+        H_reg = H + lam * np.eye(H.shape[0])
+
+        try:
+            dx = -np.linalg.solve(H_reg, g)
+        except np.linalg.LinAlgError:
+            if verbose:
+                print(f"[Lewis oracle] Hessian solve failed at step {k}.")
+            return None
+
+        descent = g @ dx
+        if descent > 0:
+            dx = -dx
+            descent = g @ dx
+
+        # Backtracking with projection in Lewis norm
+        alpha = 1.0
+        success = False
+        for _ in range(60):
+            x_trial = x + alpha * dx
+            x_trial = project_onto_lewis_ball(x_trial, center, R, L)
+
+            F_trial = fsmooth_value(A_groups, b_groups, x_trial, beta, delta)
+            if (
+                np.isfinite(F_trial)
+                and F_trial <= F + backtrack_c * alpha * descent
+            ):
+                success = True
+                break
+
+            alpha *= backtrack_beta
+
+        if not success:
+            # No improving step found, return current iterate
+            if verbose:
+                print(f"[Lewis oracle] Line search failed at step {k}.")
+            return x
+
+        x = x_trial
+        F = F_trial
+
+    return x
+
+
+# ------------------------------------------------------------
+# 5. Outer ball-oracle scheme in Lewis geometry
 # ------------------------------------------------------------
 
 def run_ball_oracle_lewis(
@@ -1768,48 +2355,42 @@ def run_ball_oracle_lewis(
     L,
     beta,
     delta,
-    step,
     R0,
-    n_outer,
-    n_inner,
-    shrink=0.99,
-    max_iters=100,
+    n_outer=100,
+    R_decay=1.0,
+    max_newton_steps=50,
     verbose=False,
     record_curve=False,
 ):
     """
-    Lewis-geometry variant of smoothed ball-oracle:
+    Lewis-geometry ball-oracle method (directly comparable to Naive Newton):
 
-      - Uses ellipsoidal balls induced by M = L^T L.
-      - Outer loop k:
-          radius R_k, center = current x
-          run n_inner gradient steps with projection in Lewis norm
-          then center <- x, R_{k+1} = shrink * R_k
-      - Total gradient steps capped by max_iters.
+      For k = 1..n_outer:
+        - Solve (approximately) with Newton:
+              x_k = argmin_{||x - center_k||_M <= R_k} F_smooth(x)
+        - center_{k+1} <- x_k
+        - R_{k+1}      <- R_decay * R_k
 
-    Evaluation uses TRUE max-loss (max_i ell_i(x)).
-    Smoothing only guides steps.
+      Counting:
+        - ONLY OUTER ITERATIONS are "iterations" for plotting.
 
-    If record_curve=True:
-      - logs (iters, best_values) for all t = 0..max_iters.
+      Evaluation:
+        - Uses TRUE max-loss max_i ell_i(x) for best-so-far.
     """
-    d = A_groups[0].shape[1]
-
     x = x0.copy()
     center = x0.copy()
     R = float(R0)
 
-    F_init = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_init):
+    F_true_init = max_group_loss(A_groups, b_groups, x)
+    if not np.isfinite(F_true_init):
         if verbose:
-            print("[BallOracle Lewis] Non-finite init loss.")
+            print("[BallOracle Lewis] Non-finite init true loss.")
         return None
 
-    base_scale = max(F_init, 1.0)
+    base_scale = max(F_true_init, 1.0)
     explode_threshold = 1e6 * base_scale
 
-    best_true = F_init
-    F_true = F_init
+    best_true = F_true_init
 
     if record_curve:
         iters = [0]
@@ -1818,68 +2399,53 @@ def run_ball_oracle_lewis(
         iters = None
         best_vals = None
 
-    it = 0
-
     for k in range(1, n_outer + 1):
-        for j in range(1, n_inner + 1):
-            if it >= max_iters:
-                break
+        x_new = newton_ball_oracle_lewis(
+            A_groups,
+            b_groups,
+            center=center,
+            R=R,
+            beta=beta,
+            delta=delta,
+            L=L,
+            max_newton_steps=max_newton_steps,
+            verbose=verbose,
+        )
+        if x_new is None or not np.all(np.isfinite(x_new)):
+            if verbose:
+                print(f"[BallOracle Lewis] Oracle failed at outer iter {k}.")
+            return None
 
-            it += 1
-
-            g = fsmooth_grad(A_groups, b_groups, x, beta, delta)
-            if g is None:
-                if verbose:
-                    print(
-                        f"[BallOracle Lewis] beta={beta:.2e},delta={delta:.2e},"
-                        f"step={step:.2e}: grad non-finite at outer={k}, inner={j}"
-                    )
-                return None
-
-            x_new = x - step * g
-            if not np.all(np.isfinite(x_new)):
-                if verbose:
-                    print(
-                        f"[BallOracle Lewis] beta={beta:.2e},delta={delta:.2e},"
-                        f"step={step:.2e}: x non-finite at iter {it}"
-                    )
-                return None
-
-            # Project in Lewis norm
-            x_new = project_onto_lewis_ball(x_new, center, R, L)
-
-            x = x_new
-
-            F_true = max_group_loss(A_groups, b_groups, x)
-            if not np.isfinite(F_true):
-                if verbose:
-                    print(
-                        f"[BallOracle Lewis] Non-finite F_true at iter {it}: {F_true}"
-                    )
-                return None
-            if F_true > explode_threshold:
-                if verbose:
-                    print(
-                        f"[BallOracle Lewis] Explosion at iter {it}: "
-                        f"F_true={F_true:.3e}"
-                    )
-                return None
-
-            if F_true < best_true:
-                best_true = F_true
-
-            if record_curve:
-                iters.append(it)
-                best_vals.append(best_true)
-                if verbose:
-                    print(
-                        f"[BallOracle Lewis] it={it}, F_true={F_true:.6e}, "
-                        f"best={best_true:.6e}, R={R:.3e}"
-                    )
-
+        x = x_new
         center = x.copy()
-        R *= shrink
-        if R <= 0 or it >= max_iters:
+
+        F_true = max_group_loss(A_groups, b_groups, x)
+        if not np.isfinite(F_true):
+            if verbose:
+                print(f"[BallOracle Lewis] Non-finite true loss at outer {k}.")
+            return None
+        if F_true > explode_threshold:
+            if verbose:
+                print(
+                    f"[BallOracle Lewis] Explosion at outer {k}: "
+                    f"F_true={F_true:.3e}"
+                )
+            return None
+
+        if F_true < best_true:
+            best_true = F_true
+
+        if record_curve:
+            iters.append(k)
+            best_vals.append(best_true)
+            if verbose:
+                print(
+                    f"[BallOracle Lewis] outer={k}, "
+                    f"F_true={F_true:.6e}, best={best_true:.6e}, R={R:.3e}"
+                )
+
+        R *= R_decay
+        if R <= 0:
             break
 
     return {
@@ -1892,7 +2458,7 @@ def run_ball_oracle_lewis(
 
 
 # ------------------------------------------------------------
-# 4. Tuning for Lewis-geometry ball-oracle
+# 6. Tuning for Lewis-geometry Newton ball-oracle
 # ------------------------------------------------------------
 
 def tune_ball_oracle_lewis(
@@ -1900,35 +2466,31 @@ def tune_ball_oracle_lewis(
     b_groups,
     x0,
     L,
-    max_iters=100,
+    n_outer=100,
     verbose=False,
 ):
     """
-    Grid search over (beta, delta, step, R0, n_outer, n_inner, shrink).
+    Tune (beta, delta, R0, R_decay) for the Lewis Newton ball-oracle.
 
-    - Uses x0 as given (no randomness).
-    - Requires n_outer * n_inner >= max_iters, so each config
-      can use at least the full step budget.
-    - Score: best TRUE max-loss along trajectory.
+    - Uses shared x0 (no new randomness).
+    - One Newton ball-oracle call per outer iteration.
+    - Score: best TRUE max-loss across outer iterations.
     """
     F_init = max_group_loss(A_groups, b_groups, x0)
     print(f"[BallOracle Lewis tune] init true max-loss = {F_init:.6e}")
 
     base = max(F_init, 1.0)
 
-    # Similar to naive, but keep steps conservative.
-    beta_grid = base * np.logspace(-3, 0, 5)   # [1e-3, ..., 1] * base
-    delta_multipliers = [0.0, 1e-2, 1e-1]
-    step_grid = np.logspace(-8, -5, 4)         # 1e-8 .. 1e-5
+    beta_grid = base * np.logspace(-3, 0, 5)      # [1e-3, ..., 1] * base
+    delta_multipliers = [0.0, 1e-3, 1e-2]         # small robust deltas
+    R0_grid = []
 
-    # Radius in Lewis norm based on x0
-    xnorm_lewis = np.linalg.norm(L @ x0)
+    # Radius choices in Lewis norm
+    xnorm_lewis = float(np.linalg.norm(L @ x0))
     base_R = xnorm_lewis if xnorm_lewis > 0 else 1.0
-    R_grid = [0.5 * base_R, 1.0 * base_R, 2.0 * base_R]
+    R0_grid.extend([0.5 * base_R, 1.0 * base_R, 2.0 * base_R])
 
-    n_outer_list = [5, 10]
-    n_inner_list = [5, 10]
-    shrink_list = [0.99, 0.95]
+    R_decay_grid = [1.0, 0.999, 0.99]
 
     best_cfg = None
     best_val = float("inf")
@@ -1936,83 +2498,71 @@ def tune_ball_oracle_lewis(
     for beta in beta_grid:
         for dm in delta_multipliers:
             delta = dm * beta
-            for step in step_grid:
-                for R0 in R_grid:
-                    for n_outer in n_outer_list:
-                        for n_inner in n_inner_list:
-                            if n_outer * n_inner < max_iters:
-                                continue
-                            for shrink in shrink_list:
-                                res = run_ball_oracle_lewis(
-                                    A_groups,
-                                    b_groups,
-                                    x0,
-                                    L=L,
-                                    beta=beta,
-                                    delta=delta,
-                                    step=step,
-                                    R0=R0,
-                                    n_outer=n_outer,
-                                    n_inner=n_inner,
-                                    shrink=shrink,
-                                    max_iters=max_iters,
-                                    verbose=False,
-                                    record_curve=False,
-                                )
-                                if res is None:
-                                    print(
-                                        "[BallOracle Lewis tune] "
-                                        f"beta={beta:.2e},delta={delta:.2e},"
-                                        f"step={step:.2e},R0={R0:.2e},"
-                                        f"outer={n_outer},inner={n_inner},"
-                                        f"shrink={shrink:.2f} -> FAILED"
-                                    )
-                                    continue
+            for R0 in R0_grid:
+                for R_decay in R_decay_grid:
+                    res = run_ball_oracle_lewis(
+                        A_groups,
+                        b_groups,
+                        x0,
+                        L=L,
+                        beta=beta,
+                        delta=delta,
+                        R0=R0,
+                        n_outer=n_outer,
+                        R_decay=R_decay,
+                        max_newton_steps=50,
+                        verbose=False,
+                        record_curve=False,
+                    )
+                    if res is None:
+                        if verbose:
+                            print(
+                                "[BallOracle Lewis tune] "
+                                f"beta={beta:.2e},delta={delta:.2e},"
+                                f"R0={R0:.2e},R_decay={R_decay:.3f} -> FAILED"
+                            )
+                        continue
 
-                                val = res["best_true"]
-                                print(
-                                    "[BallOracle Lewis tune] "
-                                    f"beta={beta:.2e},delta={delta:.2e},"
-                                    f"step={step:.2e},R0={R0:.2e},"
-                                    f"outer={n_outer},inner={n_inner},"
-                                    f"shrink={shrink:.2f} "
-                                    f"-> best={val:.6e}"
-                                )
+                    val = res["best_true"]
+                    print(
+                        "[BallOracle Lewis tune] "
+                        f"beta={beta:.2e},delta={delta:.2e},"
+                        f"R0={R0:.2e},R_decay={R_decay:.3f} "
+                        f"-> best={val:.6e}"
+                    )
 
-                                if np.isfinite(val) and val + 1e-9 < best_val:
-                                    best_val = val
-                                    best_cfg = {
-                                        "beta": float(beta),
-                                        "delta": float(delta),
-                                        "step": float(step),
-                                        "R0": float(R0),
-                                        "n_outer": int(n_outer),
-                                        "n_inner": int(n_inner),
-                                        "shrink": float(shrink),
-                                    }
+                    if np.isfinite(val) and val + 1e-9 < best_val:
+                        best_val = val
+                        best_cfg = {
+                            "beta": float(beta),
+                            "delta": float(delta),
+                            "R0": float(R0),
+                            "R_decay": float(R_decay),
+                            "n_outer": int(n_outer),
+                        }
 
     return best_cfg, best_val
 
 
 # ------------------------------------------------------------
-# 5. Run Lewis-geometry method with shared-style warm start
+# 7. Run Lewis-geometry method with shared-style warm start
 # ------------------------------------------------------------
 
-warm_start_lewis = DEFAULT_WARM_START  # "erm", "zero", or "rand"
+warm_start_lewis = DEFAULT_WARM_START  # e.g., "rand" to match others
 x0_lewis = get_init(warm_start_lewis)
 
 print(f"\n[BallOracle Lewis] Using warm start = {warm_start_lewis}")
 print("init true max-loss       =", max_group_loss(A_groups, b_groups, x0_lewis))
 
-# Build Lewis geometry once (shared for tuning and final run)
-L_lewis = build_lewis_geometry(A_groups)
+# Build Lewis geometry once
+L_lewis = build_lewis_geometry(A_groups, b_groups, p=np.inf)
 
 lewis_cfg, lewis_best = tune_ball_oracle_lewis(
     A_groups,
     b_groups,
     x0_lewis,
     L=L_lewis,
-    max_iters=100,
+    n_outer=100,
     verbose=False,
 )
 
@@ -2031,12 +2581,10 @@ if lewis_cfg is not None:
         L=L_lewis,
         beta=lewis_cfg["beta"],
         delta=lewis_cfg["delta"],
-        step=lewis_cfg["step"],
         R0=lewis_cfg["R0"],
         n_outer=lewis_cfg["n_outer"],
-        n_inner=lewis_cfg["n_inner"],
-        shrink=lewis_cfg["shrink"],
-        max_iters=100,
+        R_decay=lewis_cfg["R_decay"],
+        max_newton_steps=50,
         verbose=False,
         record_curve=True,
     )
@@ -2059,727 +2607,12 @@ else:
     print("[BallOracle Lewis] No stable configuration found.")
 
 # ============================================================
-# Block: Ball-Oracle Lewis Geometry with Newton-style Oracle
-#         (100 outers; only outers counted as iterations)
-# ============================================================
-
-import numpy as np
-
-# Assumes already defined in previous blocks:
-#   - group_losses(A_groups, b_groups, x)
-#   - max_group_loss(A_groups, b_groups, x)
-#   - fsmooth_value(A_groups, b_groups, x, beta, delta)
-#   - fsmooth_grad(A_groups, b_groups, x, beta, delta)
-#   - get_init(warm_start)
-#   - A_groups, b_groups
-#   - results_curves, results_final
-
-
-# ------------------------------------------------------------
-# 1. Lewis-style metric and projection
-# ------------------------------------------------------------
-
-def compute_lewis_metric(A_groups, eps=1e-8):
-    """
-    Simple Lewis-style proxy metric:
-
-        M = (sum_i (A_i^T A_i / n_i)) / trace + eps * I
-
-    Returns:
-      M (d x d SPD)
-      L such that M = L^T L  (Cholesky factor)
-    """
-    d = A_groups[0].shape[1]
-    M = np.zeros((d, d))
-
-    for A_i in A_groups:
-        n_i = max(A_i.shape[0], 1)
-        M += (A_i.T @ A_i) / n_i
-
-    tr = np.trace(M)
-    if not np.isfinite(tr) or tr <= 0:
-        M = np.eye(d)
-    else:
-        M = M / tr
-
-    M += eps * np.eye(d)
-
-    try:
-        L = np.linalg.cholesky(M)
-    except np.linalg.LinAlgError:
-        M = np.eye(d)
-        L = np.eye(d)
-
-    return M, L
-
-
-def project_onto_lewis_ball(x, center, R, L):
-    """
-    Project x onto ellipsoid {y : ||L (y - center)||_2 <= R}.
-
-    If inside, returns x unchanged.
-    """
-    diff = x - center
-    z = L @ diff
-    nz = np.linalg.norm(z)
-    if not np.isfinite(nz) or nz <= R or nz == 0.0:
-        return x
-    scale = R / nz
-    return center + scale * diff
-
-
-# ------------------------------------------------------------
-# 2. Newton-style ball oracle (inner solver)
-# ------------------------------------------------------------
-
-def lewis_ball_newton_oracle(
-    A_groups,
-    b_groups,
-    center,
-    R,
-    beta,
-    delta=0.0,
-    x_init=None,
-    M=None,
-    L=None,
-    max_newton_iters=100,
-    grad_tol=1e-6,
-    f_tol=1e-9,
-    backtrack_beta=0.5,
-    backtrack_c=1e-4,
-    verbose=False,
-):
-    """
-    Approximately solve:
-
-        minimize_x  F_smooth(x; beta, delta)
-        s.t.        ||L (x - center)||_2 <= R
-
-    using a quasi-Newton step with metric M and line search,
-    with projection onto the Lewis ball at EVERY candidate step.
-
-    - Uses M (SPD) as a preconditioner / Hessian proxy:
-        step = - M^{-1} grad
-      (Full Hessian of F_smooth is doable but overkill here.)
-    - Always enforces feasibility via projection.
-    - Terminates when:
-        ||grad||_2 small, or
-        improvement in F_smooth is tiny, or
-        max_newton_iters reached.
-
-    Returns:
-      dict:
-        - x: final feasible point
-        - F_smooth: smoothed objective at x
-        - F_true: true max-loss at x
-      or None on failure.
-    """
-    if M is None or L is None:
-        M, L = compute_lewis_metric(A_groups)
-
-    d = A_groups[0].shape[1]
-
-    if x_init is None:
-        x = center.copy()
-    else:
-        x = x_init.copy()
-        # Ensure starting point is feasible
-        x = project_onto_lewis_ball(x, center, R, L)
-
-    # Initial objective and grad
-    F_sm = fsmooth_value(A_groups, b_groups, x, beta, delta)
-    g = fsmooth_grad(A_groups, b_groups, x, beta, delta)
-    if F_sm is np.inf or g is None or not np.all(np.isfinite(g)):
-        if verbose:
-            print("[Lewis Oracle] bad initial F/grad.")
-        return None
-
-    F_true = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_true):
-        if verbose:
-            print("[Lewis Oracle] bad initial true loss.")
-        return None
-
-    for it in range(1, max_newton_iters + 1):
-        # Check gradient norm stopping
-        g_norm = np.linalg.norm(g)
-        if g_norm <= grad_tol:
-            break
-
-        # Quasi-Newton step: s ≈ - M^{-1} g
-        try:
-            s = np.linalg.solve(M, -g)
-        except np.linalg.LinAlgError:
-            if verbose:
-                print("[Lewis Oracle] M solve failed.")
-            return None
-        if not np.all(np.isfinite(s)):
-            if verbose:
-                print("[Lewis Oracle] non-finite step.")
-            return None
-
-        # Backtracking line search with projection
-        descent_dir = g @ s
-        # If not a descent direction, flip (defensive)
-        if descent_dir > 0:
-            s = -s
-            descent_dir = g @ s
-
-        alpha = 1.0
-        success = False
-        for _ in range(40):
-            x_candidate = x + alpha * s
-            x_proj = project_onto_lewis_ball(x_candidate, center, R, L)
-
-            F_sm_new = fsmooth_value(A_groups, b_groups, x_proj, beta, delta)
-            if not np.isfinite(F_sm_new):
-                alpha *= backtrack_beta
-                continue
-
-            # Armijo condition in terms of (x_proj - x)
-            diff = x_proj - x
-            lhs = F_sm_new
-            rhs = F_sm + backtrack_c * (g @ diff)
-
-            if lhs <= rhs:
-                success = True
-                break
-            alpha *= backtrack_beta
-
-        if not success:
-            # If no acceptable step, we consider we're stuck.
-            if verbose:
-                print("[Lewis Oracle] line search failed; stopping.")
-            break
-
-        # Accept step
-        x = x_proj
-        F_prev = F_sm
-        F_sm = F_sm_new
-        g = fsmooth_grad(A_groups, b_groups, x, beta, delta)
-        if g is None or not np.all(np.isfinite(g)):
-            if verbose:
-                print("[Lewis Oracle] grad became non-finite.")
-            return None
-
-        # Check small improvement
-        if abs(F_prev - F_sm) <= f_tol * max(1.0, abs(F_prev)):
-            break
-
-    # Final true loss check
-    F_true = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_true):
-        if verbose:
-            print("[Lewis Oracle] final F_true non-finite.")
-        return None
-
-    return {"x": x, "F_smooth": F_sm, "F_true": F_true}
-
-
-# ------------------------------------------------------------
-# 3. Outer algorithm: 100 balls, count only outers
-# ------------------------------------------------------------
-
-def run_ball_oracle_lewis_newton_outer(
-    A_groups,
-    b_groups,
-    x0,
-    beta,
-    R0,
-    R_decay=1.0,
-    n_outer=100,
-    delta=0.0,
-    verbose=False,
-    record_curve=False,
-):
-    """
-    Outer loop:
-
-      x_0 given.
-      For k = 1..n_outer:
-        - Call lewis_ball_newton_oracle with center = x_{k-1}, radius R_k.
-        - Set x_k = oracle solution.
-        - Shrink radius: R_{k+1} = R_decay * R_k.
-
-    Only outer iterations are counted in the curve:
-      - if record_curve:
-          iters[0] = 0, best_vals[0] = F_true(x0)
-          iters[k] = k, best_vals[k] = best_so_far after ball k.
-
-    Returns dict like other methods, or None on failure.
-    """
-    M, L = compute_lewis_metric(A_groups)
-
-    x = x0.copy()
-    center = x0.copy()
-    R = float(R0)
-
-    F_true = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_true):
-        if verbose:
-            print("[BallOracle Lewis outer] Non-finite init loss.")
-        return None
-
-    base_scale = max(F_true, 1.0)
-    explode_threshold = 1e6 * base_scale
-
-    best_true = F_true
-
-    if record_curve:
-        iters = [0]
-        best_vals = [best_true]
-    else:
-        iters = None
-        best_vals = None
-
-    for k in range(1, n_outer + 1):
-        if R <= 0:
-            break
-
-        oracle_res = lewis_ball_newton_oracle(
-            A_groups,
-            b_groups,
-            center=center,
-            R=R,
-            beta=beta,
-            delta=delta,
-            x_init=x,     # warm-start from previous
-            M=M,
-            L=L,
-            max_newton_iters=100,
-            grad_tol=1e-6,
-            f_tol=1e-9,
-            verbose=False,
-        )
-
-        if oracle_res is None:
-            if verbose:
-                print(f"[BallOracle Lewis outer] oracle FAILED at outer={k}.")
-            return None
-
-        x = oracle_res["x"]
-        center = x.copy()
-        R *= R_decay
-
-        # Monitor true objective
-        F_true = oracle_res["F_true"]
-        if not np.isfinite(F_true):
-            if verbose:
-                print(f"[BallOracle Lewis outer] Non-finite F_true at outer={k}.")
-            return None
-        if F_true > explode_threshold:
-            if verbose:
-                print(
-                    f"[BallOracle Lewis outer] Explosion at outer={k}: "
-                    f"F_true={F_true:.3e}"
-                )
-            return None
-
-        if F_true < best_true:
-            best_true = F_true
-
-        if record_curve:
-            iters.append(k)
-            best_vals.append(best_true)
-
-        if verbose:
-            print(
-                f"[BallOracle Lewis outer] k={k}, R={R:.3e}, "
-                f"F_true={F_true:.6e}, best={best_true:.6e}"
-            )
-
-    return {
-        "iters": iters,
-        "best_values": best_vals,
-        "x_final": x,
-        "best_true": best_true,
-        "final_true": F_true,
-    }
-
-
-# ------------------------------------------------------------
-# 4. Tuning over beta, R0, R_decay (modest)
-# ------------------------------------------------------------
-
-def tune_ball_oracle_lewis_newton_outer(
-    A_groups,
-    b_groups,
-    x0,
-    n_outer=100,
-    verbose=False,
-):
-    """
-    Modest grid over:
-      - beta  (smoothing)
-      - R0    (initial radius)
-      - R_decay (radius shrink per outer)
-
-    Score: best TRUE max-loss over outer iterations.
-
-    Uses x0 as given, no new randomness.
-    """
-    F_init = max_group_loss(A_groups, b_groups, x0)
-    print(f"[BallOracle Lewis tune-newton] init true max-loss = {F_init:.6e}")
-
-    base = max(F_init, 1.0)
-    xnorm = float(np.linalg.norm(x0))
-    base_R = xnorm if xnorm > 0 else 1.0
-
-    beta_grid = base * np.array([1e-3, 1e-2, 1e-1, 1.0])
-    R0_grid = np.array([0.5 * base_R, 2.0 * base_R, 10.0 * base_R])
-    R_decay_grid = np.array([1.0, 0.999, 0.99])
-
-    best_cfg = None
-    best_val = float("inf")
-
-    for beta in beta_grid:
-        if beta <= 0 or not np.isfinite(beta):
-            continue
-        for R0 in R0_grid:
-            for R_decay in R_decay_grid:
-                res = run_ball_oracle_lewis_newton_outer(
-                    A_groups,
-                    b_groups,
-                    x0,
-                    beta=beta,
-                    R0=R0,
-                    R_decay=R_decay,
-                    n_outer=n_outer,
-                    delta=0.0,
-                    verbose=False,
-                    record_curve=False,
-                )
-                if res is None:
-                    print(
-                        f"[BallOracle Lewis tune-newton] "
-                        f"beta={beta:.2e},R0={R0:.2e},R_decay={R_decay:.3f} -> FAILED"
-                    )
-                    continue
-
-                val = res["best_true"]
-                print(
-                    f"[BallOracle Lewis tune-newton] "
-                    f"beta={beta:.2e},R0={R0:.2e},R_decay={R_decay:.3f} "
-                    f"-> best={val:.6e}"
-                )
-
-                if np.isfinite(val) and val + 1e-9 < best_val:
-                    best_val = val
-                    best_cfg = {
-                        "beta": float(beta),
-                        "R0": float(R0),
-                        "R_decay": float(R_decay),
-                        "n_outer": int(n_outer),
-                    }
-
-    return best_cfg, best_val
-
-
-# ------------------------------------------------------------
-# 5. Run with shared-style warm start and log curve
-# ------------------------------------------------------------
-
-warm_start_lewis_newton = "rand"   # keep consistent for fairness
-x0_lewis_newton = get_init(warm_start_lewis_newton)
-
-print(f"\n[BallOracle Lewis newton] Using warm start = {warm_start_lewis_newton}")
-print("init true max-loss       =",
-      max_group_loss(A_groups, b_groups, x0_lewis_newton))
-
-lewisN_cfg, lewisN_best = tune_ball_oracle_lewis_newton_outer(
-    A_groups,
-    b_groups,
-    x0_lewis_newton,
-    n_outer=100,
-    verbose=False,
-)
-
-if lewisN_cfg is not None:
-    print(
-        "[BallOracle Lewis newton] Selected cfg:",
-        lewisN_cfg,
-        "with best tuned value:",
-        lewisN_best,
-    )
-
-    final_lewisN = run_ball_oracle_lewis_newton_outer(
-        A_groups,
-        b_groups,
-        x0_lewis_newton,
-        beta=lewisN_cfg["beta"],
-        R0=lewisN_cfg["R0"],
-        R_decay=lewisN_cfg["R_decay"],
-        n_outer=lewisN_cfg["n_outer"],
-        delta=0.0,
-        verbose=False,
-        record_curve=True,
-    )
-
-    if final_lewisN is not None and final_lewisN["iters"] is not None:
-        x_final = final_lewisN["x_final"]
-        F_final = max_group_loss(A_groups, b_groups, x_final)
-
-        label = "Ball-Oracle Lewis (Newton, outer iters)"
-        results_curves[label] = {
-            "iters": final_lewisN["iters"],
-            "best_values": final_lewisN["best_values"],
-        }
-        results_final[label] = F_final
-
-        print(f"[BallOracle Lewis newton] final true max-loss = {F_final:.6e}")
-    else:
-        print("[BallOracle Lewis newton] Final run failed; no curve recorded.")
-else:
-    print("[BallOracle Lewis newton] No stable configuration found.")
-
-# ============================================================
-# Block: Ball-Oracle Lewis (Newton + Annealing, tuned mildly)
-# ============================================================
-
-# Assumes:
-# - compute_lewis_metric(...)
-# - lewis_ball_newton_oracle(...)
-# - get_init(...)
-# - group_losses, max_group_loss
-# - results_curves, results_final
-# are already defined.
-
-def run_ball_oracle_lewis_newton_anneal(
-    A_groups,
-    b_groups,
-    x0,
-    beta0,
-    beta_decay=1.0,
-    R0=1.0,
-    R_decay=1.0,
-    n_outer=100,
-    delta=0.0,
-    verbose=False,
-    record_curve=False,
-):
-    """
-    Newton-based Lewis geometry ball-oracle with geometric annealing.
-
-    At outer iteration k:
-      - Call lewis_ball_newton_oracle() on ball B_M(center, R_k) with smoothing beta_k.
-      - Update:
-            x_{k}  = oracle solution
-            center = x_{k}
-            beta_{k+1} = beta_decay * beta_k
-            R_{k+1}    = R_decay   * R_k
-
-    We count ONLY outer iterations as "iterations" for plotting.
-    If record_curve=True:
-      - Logs (0, F_init) then k = 1..n_outer with best-so-far true max-loss.
-    """
-    # Precompute Lewis metric once
-    M, L = compute_lewis_metric(A_groups)
-
-    x = x0.copy()
-    center = x0.copy()
-    beta = float(beta0)
-    R = float(R0)
-
-    F_true = max_group_loss(A_groups, b_groups, x)
-    if not np.isfinite(F_true):
-        if verbose:
-            print("[Lewis Newton anneal] non-finite init loss.")
-        return None
-
-    best_true = F_true
-
-    if record_curve:
-        iters = [0]
-        best_vals = [best_true]
-    else:
-        iters = None
-        best_vals = None
-
-    for k in range(1, n_outer + 1):
-        # Solve the smoothed subproblem inside the current ball
-        res = lewis_ball_newton_oracle(
-            A_groups,
-            b_groups,
-            center=center,
-            R=R,
-            beta=beta,
-            delta=delta,
-            x_init=x,
-            M=M,
-            L=L,
-            max_newton_iters=100,
-            grad_tol=1e-6,
-            f_tol=1e-9,
-            verbose=False,
-        )
-        if res is None:
-            if verbose:
-                print(f"[Lewis Newton anneal] oracle failed at k={k}")
-            break
-
-        x = res["x"]
-        F_true = res["F_true"]
-        if not np.isfinite(F_true):
-            if verbose:
-                print(f"[Lewis Newton anneal] non-finite F_true at k={k}")
-            break
-
-        if F_true < best_true:
-            best_true = F_true
-
-        if record_curve:
-            iters.append(k)
-            best_vals.append(best_true)
-            if verbose:
-                print(
-                    f"[Lewis Newton anneal] k={k}, beta={beta:.3e}, "
-                    f"R={R:.3e}, F_true={F_true:.6e}, best={best_true:.6e}"
-                )
-
-        # Geometric annealing
-        beta *= beta_decay
-        R *= R_decay
-        center = x.copy()
-
-    return {
-        "iters": iters,
-        "best_values": best_vals,
-        "x_final": x,
-        "best_true": best_true,
-        "final_true": F_true,
-    }
-
-
-def tune_ball_oracle_lewis_newton_anneal(
-    A_groups,
-    b_groups,
-    x0,
-    n_outer=100,
-):
-    """
-    Mild grid search for annealed Newton-Lewis.
-
-    - beta0 in {1e-3, 3e-3, 1e-2, 1e-1} * F_init
-      (includes the successful 1e-3 * F_init scale).
-    - beta_decay in {1.0, 0.999, 0.99}
-    - R0 in {0.5, 2, 10} * ||x0|| (if ||x0||=0 use 1)
-    - R_decay in {1.0, 0.999, 0.99}
-
-    Score: best TRUE max-loss along outer iterations 0..n_outer.
-    """
-    F_init = max_group_loss(A_groups, b_groups, x0)
-    print(f"[Lewis Newton anneal tune] init true max-loss = {F_init:.6e}")
-    base = max(F_init, 1.0)
-
-    xnorm = float(np.linalg.norm(x0))
-    base_R = xnorm if xnorm > 0 else 1.0
-
-    beta0_grid = base * np.array([1e-3, 3e-3, 1e-2, 1e-1])
-    beta_decay_grid = [1.0, 0.999, 0.99]
-    R0_grid = [0.5 * base_R, 2.0 * base_R, 10.0 * base_R]
-    R_decay_grid = [1.0, 0.999, 0.99]
-
-    best_cfg = None
-    best_val = float("inf")
-
-    for beta0 in beta0_grid:
-        for bdec in beta_decay_grid:
-            for R0 in R0_grid:
-                for Rdec in R_decay_grid:
-                    res = run_ball_oracle_lewis_newton_anneal(
-                        A_groups,
-                        b_groups,
-                        x0,
-                        beta0=beta0,
-                        beta_decay=bdec,
-                        R0=R0,
-                        R_decay=Rdec,
-                        n_outer=n_outer,
-                        record_curve=False,
-                    )
-                    if res is None:
-                        continue
-                    val = res["best_true"]
-                    print(
-                        f"[Lewis Newton anneal tune] "
-                        f"beta0={beta0:.2e}, bdec={bdec:.3f}, "
-                        f"R0={R0:.2e}, Rdec={Rdec:.3f} -> best={val:.6e}"
-                    )
-                    if np.isfinite(val) and val < best_val:
-                        best_val = val
-                        best_cfg = {
-                            "beta0": float(beta0),
-                            "beta_decay": float(bdec),
-                            "R0": float(R0),
-                            "R_decay": float(Rdec),
-                        }
-
-    return best_cfg, best_val
-
-
-# ============================================================
-# Block: Ball-Oracle Lewis (Newton, anneal) - final run
-# ============================================================
-
-warm_start_lewis_newton_anneal = "rand"  # keep consistent with others
-x0_lewis_newton_anneal = get_init(warm_start_lewis_newton_anneal)
-
-print(f"\n[BallOracle Lewis newton anneal] Using warm start = {warm_start_lewis_newton_anneal}")
-print("init true max-loss       =", max_group_loss(A_groups, b_groups, x0_lewis_newton_anneal))
-
-# Tune (this should already be defined elsewhere)
-cfg_ann, best_ann = tune_ball_oracle_lewis_newton_anneal(
-    A_groups,
-    b_groups,
-    x0_lewis_newton_anneal,
-    n_outer=100,
-)
-
-if cfg_ann is not None:
-    print("[BallOracle Lewis newton anneal] Selected cfg:", cfg_ann, "best:", best_ann)
-
-    # *** KEY LINE: expose for the time-vs-accuracy block ***
-    lewis_newton_anneal_cfg = cfg_ann
-
-    # Final run with curve recording for iteration-based plots
-    final_ann = run_ball_oracle_lewis_newton_anneal(
-        A_groups,
-        b_groups,
-        x0_lewis_newton_anneal,
-        beta0=cfg_ann["beta0"],
-        beta_decay=cfg_ann["beta_decay"],
-        R0=cfg_ann["R0"],
-        R_decay=cfg_ann["R_decay"],
-        n_outer=100,
-        verbose=False,
-        record_curve=True,
-    )
-
-    if final_ann is not None and final_ann.get("iters") is not None:
-        x_final = final_ann["x_final"]
-        F_final = max_group_loss(A_groups, b_groups, x_final)
-
-        label = "Ball-Oracle Lewis (Newton, anneal)"
-        results_curves[label] = {
-            "iters": final_ann["iters"],
-            "best_values": final_ann["best_values"],
-        }
-        results_final[label] = F_final
-
-        print(f"[BallOracle Lewis newton anneal] final true max-loss = {F_final:.6e}")
-    else:
-        print("[BallOracle Lewis newton anneal] Final run failed; no curve recorded.")
-else:
-    print("[BallOracle Lewis newton anneal] No stable configuration found.")
-
-# ============================================================
-# Block: Final Convergence Plot (0–100 outer its, log–log)
+# Block: Final Convergence Plot (0–100 its, log–log, OPT-subtracted)
 # ============================================================
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Helper: pick best label from a list of candidate labels by results_final
 def pick_best_label(candidates, results_final):
     best_label = None
     best_val = float("inf")
@@ -2791,32 +2624,34 @@ def pick_best_label(candidates, results_final):
                 best_label = lbl
     return best_label
 
-# Define families
+# Families consistent with logging from each block
 subgrad_family = [
     "Subgradient Max (fixed)",
     "Subgradient Max (dim)",
     "Subgradient Max",
 ]
+
 smooth_family = [
-    "F_smooth GD",
+    "F_smooth GD (best)",
+    "F_smooth Heavy-Ball (best)",
+    "F_smooth Nesterov (best)",
 ]
-ipm_family = [
-    "IPM",
-]
+
+ipm_family = ["IPM"]
+
 naive_family = [
     "Ball-Oracle Naive Geometry",
     "Ball-Oracle Naive Geometry (anneal)",
 ]
+
 lewis_family = [
     "Ball-Oracle Lewis Geometry",
-    "Ball-Oracle Lewis Geometry (anneal)",
-    "Ball-Oracle Lewis (Newton, outer iters)",
+    "Ball-Oracle Lewis (Newton)",
     "Ball-Oracle Lewis (Newton, anneal)",
 ]
 
 selected_labels = []
 
-# Pick best-of for each family, if available
 best_subgrad = pick_best_label(subgrad_family, results_final)
 if best_subgrad is not None:
     selected_labels.append(best_subgrad)
@@ -2829,17 +2664,23 @@ best_ipm = pick_best_label(ipm_family, results_final)
 if best_ipm is not None:
     selected_labels.append(best_ipm)
 
-# Our naive geometry (one curve)
 best_naive = pick_best_label(naive_family, results_final)
 if best_naive is not None:
     selected_labels.append(best_naive)
 
-# Our Lewis geometry (one curve)
 best_lewis = pick_best_label(lewis_family, results_final)
 if best_lewis is not None:
     selected_labels.append(best_lewis)
 
 plt.figure(figsize=(9, 5))
+
+# Retrieve OPT (subtract baseline)
+F_opt = results_final.get("OPT", None)
+if F_opt is not None and np.isfinite(F_opt):
+    print(f"[Plot] Subtracting OPT = {F_opt:.6e}")
+else:
+    print("[Plot] No OPT found; plotting raw losses.")
+    F_opt = 0.0  # fallback (no subtraction)
 
 # ERM baseline (horizontal line)
 erm_val = None
@@ -2849,18 +2690,19 @@ elif "ERM baseline" in results_final and np.isfinite(results_final["ERM baseline
     erm_val = results_final["ERM baseline"]
 
 if erm_val is not None:
+    y_val = max(erm_val - F_opt, 1e-16)
     plt.axhline(
-        y=erm_val,
+        y=y_val,
         linestyle="--",
         linewidth=1.5,
         color="gray",
-        label=f"ERM ({erm_val:.2e})",
+        label=f"ERM - OPT ({y_val:.2e})",
     )
 
-# Plot selected curves
+# Plot selected curves (subtract OPT)
 for label in selected_labels:
-    data = results_curves.get(label, None)
-    if data is None:
+    data = results_curves.get(label)
+    if not data:
         continue
 
     iters = np.asarray(data.get("iters", []), dtype=float)
@@ -2868,22 +2710,23 @@ for label in selected_labels:
     if iters.size == 0 or vals.size == 0:
         continue
 
-    # Keep finite points
     mask = np.isfinite(iters) & np.isfinite(vals)
     iters = iters[mask]
     vals = vals[mask]
     if iters.size == 0:
         continue
 
-    # Shift by +1 so that iteration 0 maps to x=1 (valid for log scale)
+    # Subtract OPT and clip to positive domain for log-scale
+    vals_shifted = np.maximum(vals - F_opt, 1e-16)
+
+    # Shift so t=0 → x=1 for log-scale
     x_plot = iters + 1.0
 
-    # Slight markers only if few points (e.g., IPM)
     marker = "o" if len(x_plot) <= 40 else None
 
     plt.plot(
         x_plot,
-        vals,
+        vals_shifted,
         label=label,
         linewidth=2.0,
         marker=marker,
@@ -2892,25 +2735,25 @@ for label in selected_labels:
 
 plt.xscale("log")
 plt.yscale("log")
-plt.xlim(left=1.0, right=101.0)  # 0..100 outer iterations -> 1..101 on x-axis
-plt.xlabel("Outer iterations (log scale)")
-plt.ylabel("Best-so-far max group loss (log scale)")
-plt.title("Convergence on Max-Loss Objective (0–100 outer iterations, log–log)")
+plt.xlim(left=1.0, right=101.0)
+plt.xlabel("Iterations (log scale)")
+plt.ylabel("Best-so-far (max-group loss – OPT) (log scale)")
+plt.title("Convergence on Max-Loss Objective (0–100 iterations, log–log, OPT-subtracted)")
 plt.grid(True, which="both", linestyle="--", linewidth=0.5)
 plt.legend()
 plt.tight_layout()
 plt.show()
 
 # ============================================================
-# Block: Time vs Accuracy for Best Tuned Methods (log–log)
+# Block: Time vs Accuracy for Best Tuned Methods (log–log, OPT-subtracted)
 # ============================================================
 
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Shared random init so timing comparison is fair
-x0_time = get_init("rand")
+# Shared init so timing comparison is fair
+x0_time = get_init(DEFAULT_WARM_START)
 
 # ------------------ Helpers ------------------ #
 
@@ -2929,69 +2772,80 @@ def scaled_times(iters, total_runtime):
     total = max(float(total_runtime), 1e-9)
     return (iters / T_max) * total
 
-# ---- Subgradient ----
+# ------------------ Timed runners ------------------ #
 
 def timed_run_subgrad(A_groups, b_groups, x0, cfg, T=100):
     if cfg is None:
         print("[Time plot] No subgrad_cfg; skipping.")
         return None
-    mode = cfg.get("mode", "fixed")
 
+    mode = cfg.get("mode", "fixed")
     start = time.perf_counter()
+
     if mode == "fixed":
         res = run_subgradient_max_fixed(
             A_groups, b_groups, x0,
-            step=cfg["step"],
-            T=T,
-            verbose=False,
-            record_curve=True,
+            step=cfg["step"], T=T, verbose=False, record_curve=True,
         )
+        label = "Subgradient Max (fixed, best)"
     else:
         res = run_subgradient_max_diminishing(
             A_groups, b_groups, x0,
-            base_step=cfg["base_step"],
-            T=T,
-            verbose=False,
-            record_curve=True,
+            base_step=cfg["base_step"], T=T, verbose=False, record_curve=True,
         )
+        label = "Subgradient Max (dim, best)"
+
     end = time.perf_counter()
 
-    if res is None or res.get("iters") is None or res.get("best_values") is None:
+    if res is None or res.get("iters") is None:
         print("[Time plot] Subgrad run failed.")
         return None
 
     times = scaled_times(res["iters"], end - start)
     vals = monotone_best(res["best_values"])
-    return times, vals
+    return label, (times, vals)
 
-# ---- Smoothed GD ----
 
 def timed_run_smooth(A_groups, b_groups, x0, cfg, T=100):
     if cfg is None:
         print("[Time plot] No smooth_cfg; skipping.")
         return None
 
+    var = cfg.get("variant", "gd")
     start = time.perf_counter()
-    res = run_smooth_gd(
-        A_groups, b_groups, x0,
-        beta=cfg["beta"],
-        delta=cfg["delta"],
-        step=cfg["step"],
-        T=T,
-        verbose=False,
-        record_curve=True,
-    )
+
+    if var == "gd":
+        res = run_smooth_gd(
+            A_groups, b_groups, x0,
+            beta=cfg["beta"], delta=cfg["delta"], step=cfg["step"],
+            T=T, verbose=False, record_curve=True,
+        )
+        label = "F_smooth GD (best)"
+    elif var == "heavy":
+        res = run_smooth_heavy_ball(
+            A_groups, b_groups, x0,
+            beta=cfg["beta"], delta=cfg["delta"], step=cfg["step"],
+            momentum=cfg["momentum"], T=T, verbose=False, record_curve=True,
+        )
+        label = "F_smooth Heavy-Ball (best)"
+    else:  # "nesterov"
+        res = run_smooth_nesterov(
+            A_groups, b_groups, x0,
+            beta=cfg["beta"], delta=cfg["delta"], step=cfg["step"],
+            momentum=cfg["momentum"], T=T, verbose=False, record_curve=True,
+        )
+        label = "F_smooth Nesterov (best)"
+
     end = time.perf_counter()
 
-    if res is None or res.get("iters") is None or res.get("best_values") is None:
-        print("[Time plot] F_smooth GD run failed.")
+    if res is None or res.get("iters") is None:
+        print(f"[Time plot] F_smooth {var} run failed.")
         return None
 
     times = scaled_times(res["iters"], end - start)
     vals = monotone_best(res["best_values"])
-    return times, vals
+    return label, (times, vals)
 
-# ---- IPM ----
 
 def timed_run_ipm(A_groups, b_groups, x0, cfg, max_steps=100):
     if cfg is None:
@@ -3001,148 +2855,76 @@ def timed_run_ipm(A_groups, b_groups, x0, cfg, max_steps=100):
     start = time.perf_counter()
     res = run_ipm(
         A_groups, b_groups, x0,
-        mu0=cfg["mu0"],
-        tau=cfg["tau"],
-        inner_iters=cfg["inner_iters"],
-        max_newton_steps=max_steps,
-        verbose=False,
-        record_curve=True,
+        mu0=cfg["mu0"], tau=cfg["tau"], inner_iters=cfg["inner_iters"],
+        max_newton_steps=max_steps, verbose=False, record_curve=True,
     )
     end = time.perf_counter()
 
-    if res is None or res.get("iters") is None or res.get("best_values") is None:
+    if res is None or res.get("iters") is None:
         print("[Time plot] IPM run failed.")
         return None
 
     times = scaled_times(res["iters"], end - start)
     vals = monotone_best(res["best_values"])
-    return times, vals
+    return "IPM (best)", (times, vals)
 
-# ---- Ball-Oracle Naive ----
 
-def timed_run_naive(A_groups, b_groups, x0, cfg, max_iters=100):
+def timed_run_naive(A_groups, b_groups, x0, cfg, max_outer=100):
     if cfg is None:
         print("[Time plot] No naive_cfg; skipping.")
+        return None
+    if "run_ball_oracle_naive" not in globals():
+        print("[Time plot] run_ball_oracle_naive not defined; skipping.")
         return None
 
     start = time.perf_counter()
     res = run_ball_oracle_naive(
         A_groups, b_groups, x0,
-        beta=cfg["beta"],
-        delta=cfg["delta"],
-        step=cfg["step"],
-        R0=cfg["R0"],
-        n_outer=cfg["n_outer"],
-        n_inner=cfg["n_inner"],
-        shrink=cfg["shrink"],
-        max_iters=max_iters,
-        verbose=False,
-        record_curve=True,
+        beta=cfg["beta"], delta=cfg.get("delta", 0.0),
+        R0=cfg["R0"], n_outer=cfg.get("n_outer", max_outer),
+        R_decay=cfg.get("R_decay", 1.0),
+        max_newton_steps=cfg.get("max_newton_steps", 50),
+        verbose=False, record_curve=True,
     )
     end = time.perf_counter()
 
-    if res is None or res.get("iters") is None or res.get("best_values") is None:
+    if res is None or res.get("iters") is None:
         print("[Time plot] Ball-Oracle Naive run failed.")
         return None
 
-    times = scaled_times(res["iters"], end - start)
+    iters = np.asarray(res["iters"], float)
     vals = monotone_best(res["best_values"])
-    return times, vals
-
-# ---- Ball-Oracle Lewis Newton / Newton+Anneal ----
-
-def timed_run_lewis_newton_best(A_groups, b_groups, x0, cfg, n_outer=100):
-    """
-    Run the best Lewis-geometry Newton-style method.
-
-    Compatible with:
-      - lewis_newton_anneal_cfg: {beta0, beta_decay, R0, R_decay}
-      - lewis_newton_cfg:       {beta, R0, R_decay?} (treated as beta0, no anneal)
-
-    Uses whichever of:
-      - run_ball_oracle_lewis_newton_anneal
-      - run_ball_oracle_lewis_newton
-    is defined in the environment.
-
-    Expects the run_* function to return either:
-      - 'iters' & 'best_values', or
-      - 'outer_iters' & 'outer_best_values'.
-    """
-    if cfg is None:
-        print("[Time plot] No Lewis Newton cfg; skipping.")
-        return None
-
-    # Pick implementation
-    if "run_ball_oracle_lewis_newton_anneal" in globals():
-        run_fn = globals()["run_ball_oracle_lewis_newton_anneal"]
-        use_anneal_style = True
-    elif "run_ball_oracle_lewis_newton" in globals():
-        run_fn = globals()["run_ball_oracle_lewis_newton"]
-        use_anneal_style = False
-    else:
-        print("[Time plot] No Lewis Newton run function found.")
-        return None
-
-    # Extract parameters in a robust way
-    if use_anneal_style:
-        beta0 = float(cfg.get("beta0", cfg.get("beta", 1.0)))
-        beta_decay = float(cfg.get("beta_decay", 1.0))
-        R0 = float(cfg.get("R0", 1.0))
-        R_decay = float(cfg.get("R_decay", 1.0))
-        start = time.perf_counter()
-        res = run_fn(
-            A_groups,
-            b_groups,
-            x0,
-            beta0=beta0,
-            beta_decay=beta_decay,
-            R0=R0,
-            R_decay=R_decay,
-            n_outer=n_outer,
-            verbose=False,
-            record_curve=True,
-        )
-        end = time.perf_counter()
-    else:
-        # Non-annealed Newton: treat cfg["beta"] as fixed beta0, decay=1
-        beta0 = float(cfg.get("beta", 1.0))
-        R0 = float(cfg.get("R0", 1.0))
-        R_decay = float(cfg.get("R_decay", 1.0))
-        start = time.perf_counter()
-        res = run_fn(
-            A_groups,
-            b_groups,
-            x0,
-            beta0=beta0,
-            beta_decay=1.0,
-            R0=R0,
-            R_decay=R_decay,
-            n_outer=n_outer,
-            verbose=False,
-            record_curve=True,
-        )
-        end = time.perf_counter()
-
-    if res is None:
-        print("[Time plot] Lewis Newton run failed: res is None.")
-        return None
-
-    # Try multiple key conventions
-    iters = res.get("iters")
-    vals = res.get("best_values")
-
-    if iters is None or vals is None:
-        iters = res.get("outer_iters", iters)
-        vals = res.get("outer_best_values", vals)
-
-    if iters is None or vals is None:
-        print("[Time plot] Lewis Newton run missing iters/best_values. Keys:", list(res.keys()))
-        return None
-
-    iters = np.asarray(iters, float)
-    vals = monotone_best(vals)
     times = scaled_times(iters, end - start)
-    return times, vals
+    return "Ball-Oracle Naive Geometry (best)", (times, vals)
+
+
+def timed_run_lewis(A_groups, b_groups, x0, cfg, L, max_outer=100):
+    if cfg is None:
+        print("[Time plot] No lewis_cfg; skipping.")
+        return None
+    if "run_ball_oracle_lewis" not in globals():
+        print("[Time plot] run_ball_oracle_lewis not defined; skipping.")
+        return None
+
+    start = time.perf_counter()
+    res = run_ball_oracle_lewis(
+        A_groups, b_groups, x0, L=L,
+        beta=cfg["beta"], delta=cfg.get("delta", 0.0),
+        R0=cfg["R0"], n_outer=cfg.get("n_outer", max_outer),
+        R_decay=cfg.get("R_decay", 1.0),
+        max_newton_steps=cfg.get("max_newton_steps", 50),
+        verbose=False, record_curve=True,
+    )
+    end = time.perf_counter()
+
+    if res is None or res.get("iters") is None:
+        print("[Time plot] Ball-Oracle Lewis run failed.")
+        return None
+
+    iters = np.asarray(res["iters"], float)
+    vals = monotone_best(res["best_values"])
+    times = scaled_times(iters, end - start)
+    return "Ball-Oracle Lewis Geometry (best)", (times, vals)
 
 # ------------------ Collect curves ------------------ #
 
@@ -3151,48 +2933,44 @@ time_curves = {}
 if "subgrad_cfg" in globals():
     out = timed_run_subgrad(A_groups, b_groups, x0_time, subgrad_cfg, T=100)
     if out is not None:
-        time_curves["Subgradient Max (best)"] = out
+        label, curve = out
+        time_curves[label] = curve
 
 if "smooth_cfg" in globals():
     out = timed_run_smooth(A_groups, b_groups, x0_time, smooth_cfg, T=100)
     if out is not None:
-        time_curves["F_smooth GD (best)"] = out
+        label, curve = out
+        time_curves[label] = curve
 
 if "ipm_cfg" in globals():
     out = timed_run_ipm(A_groups, b_groups, x0_time, ipm_cfg, max_steps=100)
     if out is not None:
-        time_curves["IPM (best)"] = out
+        label, curve = out
+        time_curves[label] = curve
 
 if "naive_cfg" in globals():
-    out = timed_run_naive(A_groups, b_groups, x0_time, naive_cfg, max_iters=100)
+    out = timed_run_naive(A_groups, b_groups, x0_time, naive_cfg, max_outer=100)
     if out is not None:
-        time_curves["Ball-Oracle Naive (best)"] = out
+        label, curve = out
+        time_curves[label] = curve
 
-# Lewis: prefer annealed Newton if available, else plain Newton
-lewis_cfg = None
-lewis_label = None
-
-if "lewis_newton_anneal_cfg" in globals():
-    lewis_cfg = lewis_newton_anneal_cfg
-    lewis_label = "Ball-Oracle Lewis (Newton+anneal, best)"
-elif "lewis_newton_cfg" in globals():
-    lewis_cfg = lewis_newton_cfg
-    lewis_label = "Ball-Oracle Lewis (Newton, best)"
-
-if lewis_cfg is not None:
-    out = timed_run_lewis_newton_best(A_groups, b_groups, x0_time, lewis_cfg, n_outer=100)
+if "lewis_cfg" in globals() and "L_lewis" in globals():
+    out = timed_run_lewis(A_groups, b_groups, x0_time, lewis_cfg, L_lewis, max_outer=100)
     if out is not None:
-        time_curves[lewis_label] = out
-    else:
-        print("[Time plot] Lewis Newton timing run returned None.")
-else:
-    print("[Time plot] No Lewis Newton cfg found; skipping Lewis curve.")
+        label, curve = out
+        time_curves[label] = curve
 
-# ------------------ Plot (log–log) ------------------ #
+# ------------------ Plot (log–log, OPT-subtracted) ------------------ #
 
 plt.figure(figsize=(9, 5))
 
-# ERM baseline
+F_opt = results_final.get("OPT", None)
+if F_opt is not None and np.isfinite(F_opt):
+    print(f"[Time plot] Subtracting OPT = {F_opt:.6e}")
+else:
+    print("[Time plot] No OPT in results_final; plotting raw losses.")
+    F_opt = 0.0
+
 erm_val = None
 if "ERM" in results_final and np.isfinite(results_final["ERM"]):
     erm_val = results_final["ERM"]
@@ -3200,41 +2978,38 @@ elif "ERM baseline" in results_final and np.isfinite(results_final["ERM baseline
     erm_val = results_final["ERM baseline"]
 
 if erm_val is not None:
+    gap = max(erm_val - F_opt, 1e-16)
     plt.axhline(
-        y=erm_val,
+        y=gap,
         linestyle="--",
         linewidth=1.5,
         color="gray",
-        label=f"ERM ({erm_val:.2e})",
+        label=f"ERM - OPT ({gap:.2e})",
     )
 
 for label, (times, vals) in time_curves.items():
     times = np.asarray(times, float)
     vals = np.asarray(vals, float)
-
     mask = np.isfinite(times) & np.isfinite(vals)
     times, vals = times[mask], vals[mask]
     if times.size == 0:
         continue
 
-    # Avoid log(0)
+    gaps = np.maximum(vals - F_opt, 1e-16)
     times = np.maximum(times, 1e-7)
 
     marker = "o" if len(times) <= 40 else None
     plt.plot(
-        times,
-        vals,
-        label=label,
-        linewidth=2.0,
-        marker=marker,
-        markersize=4 if marker else 0,
+        times, gaps,
+        label=label, linewidth=2.0,
+        marker=marker, markersize=4 if marker else 0,
     )
 
 plt.xscale("log")
-plt.yscale("log")
+# plt.yscale("log")
 plt.xlabel("Runtime (seconds, log scale)")
-plt.ylabel("Best-so-far max group loss (log scale)")
-plt.title("Time vs Accuracy: Best Tuned Methods (log–log, shared rand init)")
+plt.ylabel("Best-so-far (max-group loss – OPT) (log scale)")
+plt.title("Time vs Accuracy: Best Tuned Methods (log–log, OPT-subtracted, shared init)")
 plt.grid(True, which="both", linestyle="--", linewidth=0.5)
 plt.legend()
 plt.tight_layout()
