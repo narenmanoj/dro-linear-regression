@@ -3,27 +3,32 @@
 Minimizes F_p(x) = ( (1/m) sum_i ell_i(x)^{p/2} )^{1/p} for 2 <= p < inf,
 which smoothly interpolates between ERM (p=2) and robust DRO (p->inf).
 
-Three solver variants mirror the structure of the p=inf (max-loss) solvers:
+Three solver variants:
 
   1. gp_newton: Plain damped Newton on the pth-power objective f_p.
   2. gp_ball_oracle_naive: Ball-oracle with Euclidean trust regions on f_p.
   3. gp_ball_oracle_lewis: Ball-oracle with Lewis-weighted trust regions on f_p
      (Algorithm 5). Achieves the min{rank(A), m}^{(p-2)/(3p-2)} rate of Theorem 2.
 
-For the theoretical algorithm (Algorithm 5), the proximal subproblems (Eq. 8)
-are solved via Newton steps, and the outer loop follows the accelerated
-proximal scheme of Carmon et al. (2022). The practical implementations here
-use direct Newton and ball-oracle approaches which are simpler but match
-the paper's experimental setup.
+Each ball-oracle variant supports an `accelerated` toggle:
+
+  accelerated=False (default): Naive repeated iteration with shrinking radius.
+  accelerated=True: MS acceleration (Algorithm 5 / Algorithm 3). The proximal
+    oracle solves  min f(x) + C_p ||x - q||_M^p  via Newton steps, then the
+    outer loop uses the Monteiro-Svaiter scheme from Carmon et al. (2022).
+    This improves the exponent on the iteration complexity.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
 from ..problem import SolverResult, max_group_loss
 from ..gp_objective import gp_value, gp_power_value, gp_power_grad, gp_power_grad_and_hessian
 from ..lewis_weights import project_onto_lewis_ball
+from ..acceleration import ms_accelerate, make_ms_oracle_gp
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +59,6 @@ def gp_newton(
     if not np.isfinite(fp):
         return None
 
-    F_true = max_group_loss(A_groups, b_groups, x)
     Fp = gp_value(A_groups, b_groups, x, p)
     best_Fp = Fp
     iters, best_vals = [0], [Fp]
@@ -104,7 +108,7 @@ def gp_newton(
 
 
 # ---------------------------------------------------------------------------
-# 2. Ball-oracle on f_p (shared inner Newton solver)
+# 2. Ball-oracle inner Newton solver for f_p
 # ---------------------------------------------------------------------------
 
 def _newton_ball_gp(
@@ -160,11 +164,104 @@ def _project_euclidean(center, R, x_trial):
     return center + (R / max(nrm, 1e-16)) * diff
 
 
-def _run_gp_ball_oracle(
+# ---------------------------------------------------------------------------
+# 3. Proximal oracle for MS acceleration (Algorithm 4 / Eq. 8)
+# ---------------------------------------------------------------------------
+
+def _proximal_oracle_gp(
+    A_groups, b_groups, q, Cp, p, M,
+    max_newton_steps=20,
+    backtrack_beta=0.5, backtrack_c=1e-4, tol=1e-8,
+):
+    """Approximately solve the proximal subproblem (Equation 8):
+
+        min_x  f(x) + C_p ||x - q||_M^p
+
+    where f(x) = sum_i ell_i(x)^{p/2} is the pth-power Gp objective.
+
+    Uses damped Newton on the composite objective. Returns the approximate
+    minimizer.
+    """
+    x = q.copy()
+    d = len(x)
+
+    def _obj(z):
+        fp = gp_power_value(A_groups, b_groups, z, p)
+        if not np.isfinite(fp):
+            return np.inf
+        diff = z - q
+        norm_M = math.sqrt(max(float(diff @ M @ diff), 0.0))
+        return fp + Cp * norm_M ** p
+
+    def _grad_hess(z):
+        g_f, H_f = gp_power_grad_and_hessian(A_groups, b_groups, z, p)
+        if g_f is None or H_f is None:
+            return None, None
+
+        diff = z - q
+        norm_M_sq = float(diff @ M @ diff)
+        norm_M = math.sqrt(max(norm_M_sq, 1e-30))
+
+        # Gradient of C_p ||z - q||_M^p
+        #   = C_p * p * ||z-q||_M^{p-2} * M(z-q)
+        g_reg = Cp * p * norm_M ** (p - 2) * (M @ diff)
+
+        # Hessian of C_p ||z - q||_M^p
+        #   = C_p * p * ||z-q||_M^{p-2} * M
+        #     + C_p * p * (p-2) * ||z-q||_M^{p-4} * M(z-q)(z-q)^T M
+        Mdiff = M @ diff
+        H_reg = Cp * p * norm_M ** (p - 2) * M
+        if p > 2 and norm_M > 1e-15:
+            H_reg += Cp * p * (p - 2) * norm_M ** (p - 4) * np.outer(Mdiff, Mdiff)
+
+        return g_f + g_reg, H_f + H_reg
+
+    obj_val = _obj(x)
+    if not np.isfinite(obj_val):
+        return None
+
+    for k in range(1, max_newton_steps + 1):
+        g, H = _grad_hess(x)
+        if g is None or H is None:
+            return x
+
+        g_norm = np.linalg.norm(g)
+        if g_norm <= tol * max(1.0, abs(obj_val)):
+            return x
+
+        lam = 1e-8 * max(1.0, g_norm)
+        try:
+            dx = -np.linalg.solve(H + lam * np.eye(d), g)
+        except np.linalg.LinAlgError:
+            return x
+
+        if g @ dx > 0:
+            dx = -dx
+
+        alpha = 1.0
+        descent = g @ dx
+        for _ in range(40):
+            x_trial = x + alpha * dx
+            obj_trial = _obj(x_trial)
+            if np.isfinite(obj_trial) and obj_trial <= obj_val + backtrack_c * alpha * descent:
+                x, obj_val = x_trial, obj_trial
+                break
+            alpha *= backtrack_beta
+        else:
+            return x
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# 4. Outer loops: naive iteration and MS-accelerated
+# ---------------------------------------------------------------------------
+
+def _run_gp_ball_oracle_naive(
     A_groups, b_groups, x0, p,
     R0, n_outer, R_decay, max_newton_steps, project_fn_factory,
 ):
-    """Shared outer loop for Gp ball-oracle methods."""
+    """Naive outer loop: iterate ball oracle calls with shrinking radius."""
     x = x0.copy()
     center = x0.copy()
     R = float(R0)
@@ -208,6 +305,79 @@ def _run_gp_ball_oracle(
     )
 
 
+def _run_gp_accelerated(
+    A_groups, b_groups, x0, p, n_outer, M,
+    max_newton_steps=20,
+):
+    """MS-accelerated outer loop for 2 <= p < inf (Algorithm 5, lines 3-4).
+
+    Uses a proximal oracle (Algorithm 4 / Eq. 8) wrapped into an MS oracle,
+    then runs Algorithm 3 (OptimalMSAcceleration) for the outer iterations.
+
+    The proximal subproblem is:
+        min f(x) + C_p ||x - q||_M^p
+    where C_p = e * p^{p+1}, giving a (p-1, C_p^{1/(p-1)})-movement bound.
+    """
+    # Build proximal oracle callable.
+    def proximal_fn(q, Cp):
+        return _proximal_oracle_gp(
+            A_groups, b_groups, q, Cp, p, M,
+            max_newton_steps=max_newton_steps,
+        )
+
+    # Gradient of f_p for the v-update in Algorithm 3.
+    def f_grad(x):
+        return gp_power_grad(A_groups, b_groups, x, p)
+
+    # Build MS oracle from proximal oracle (Algorithm 4 / Lemma D.20).
+    ms_oracle = make_ms_oracle_gp(
+        proximal_oracle_fn=proximal_fn,
+        f_grad=f_grad,
+        M=M,
+        p=p,
+    )
+
+    # Value function for tracking.
+    def f_value(x):
+        return gp_power_value(A_groups, b_groups, x, p)
+
+    # Run Algorithm 3 with s = p - 1 (movement bound order for finite p).
+    iterates = ms_accelerate(
+        f_value=f_value,
+        f_grad=f_grad,
+        ms_oracle=ms_oracle,
+        x0=x0,
+        M=M,
+        T=n_outer,
+        s=p - 1,  # finite-p movement bound
+    )
+
+    # Convert iterates to SolverResult, tracking best Gp value.
+    best = gp_value(A_groups, b_groups, x0, p)
+    iters, best_vals = [0], [best]
+    x_best = x0.copy()
+
+    for k, x_k in enumerate(iterates[1:], 1):
+        if not np.all(np.isfinite(x_k)):
+            continue
+        Fp = gp_value(A_groups, b_groups, x_k, p)
+        if np.isfinite(Fp) and Fp < best:
+            best = Fp
+            x_best = x_k.copy()
+        iters.append(k)
+        best_vals.append(best)
+
+    return SolverResult(
+        x_final=x_best, best_loss=best,
+        iters=iters, best_values=best_vals,
+        info={"p": p, "method": "ball_oracle_accelerated"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Public API
+# ---------------------------------------------------------------------------
+
 def gp_ball_oracle_naive(
     A_groups: list[np.ndarray],
     b_groups: list[np.ndarray],
@@ -217,18 +387,31 @@ def gp_ball_oracle_naive(
     n_outer: int = 100,
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
+    accelerated: bool = False,
 ) -> SolverResult | None:
     """Ball-oracle method for Gp objective with Euclidean geometry.
 
     Uses trust regions ||x - center||_2 <= R, giving m^{(p-2)/(3p-2)} rate.
-    """
-    def factory(center, R):
-        return lambda x_trial: _project_euclidean(center, R, x_trial)
 
-    return _run_gp_ball_oracle(
-        A_groups, b_groups, x0, p,
-        R0, n_outer, R_decay, max_newton_steps, factory,
-    )
+    Args:
+        accelerated: If True, uses MS acceleration (Algorithm 3 + Algorithm 4)
+            with the proximal oracle from Eq. 8. R0 and R_decay are ignored;
+            the proximal regularization handles convergence.
+    """
+    if accelerated:
+        d = A_groups[0].shape[1]
+        M = np.eye(d)
+        return _run_gp_accelerated(
+            A_groups, b_groups, x0, p, n_outer, M,
+            max_newton_steps=max_newton_steps,
+        )
+    else:
+        def factory(center, R):
+            return lambda x_trial: _project_euclidean(center, R, x_trial)
+        return _run_gp_ball_oracle_naive(
+            A_groups, b_groups, x0, p,
+            R0, n_outer, R_decay, max_newton_steps, factory,
+        )
 
 
 def gp_ball_oracle_lewis(
@@ -241,6 +424,7 @@ def gp_ball_oracle_lewis(
     n_outer: int = 100,
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
+    accelerated: bool = False,
 ) -> SolverResult | None:
     """Ball-oracle method for Gp objective with Lewis geometry (Algorithm 5).
 
@@ -252,18 +436,27 @@ def gp_ball_oracle_lewis(
         L: Cholesky factor from lewis_weights.build_lewis_geometry(p=p).
            Note: for best results, Lewis weights should be computed with the
            same p as the objective.
+        accelerated: If True, uses MS acceleration (Algorithm 3 + Algorithm 4)
+            with the proximal oracle from Eq. 8. R0 and R_decay are ignored;
+            the proximal regularization handles convergence.
     """
-    def factory(center, R):
-        return lambda x_trial: project_onto_lewis_ball(x_trial, center, R, L)
-
-    return _run_gp_ball_oracle(
-        A_groups, b_groups, x0, p,
-        R0, n_outer, R_decay, max_newton_steps, factory,
-    )
+    if accelerated:
+        M = L.T @ L
+        return _run_gp_accelerated(
+            A_groups, b_groups, x0, p, n_outer, M,
+            max_newton_steps=max_newton_steps,
+        )
+    else:
+        def factory(center, R):
+            return lambda x_trial: project_onto_lewis_ball(x_trial, center, R, L)
+        return _run_gp_ball_oracle_naive(
+            A_groups, b_groups, x0, p,
+            R0, n_outer, R_decay, max_newton_steps, factory,
+        )
 
 
 # ---------------------------------------------------------------------------
-# 3. Interpolation path: sweep over p to trace utility-robustness tradeoff
+# 6. Interpolation path: sweep over p to trace utility-robustness tradeoff
 # ---------------------------------------------------------------------------
 
 def interpolation_path(
@@ -298,18 +491,13 @@ def interpolation_path(
     from ..problem import group_losses as _group_losses
 
     if p_values is None:
-        # Log-spaced from p=2 to p=128 (near-robust for typical m).
         p_values = [2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0, 128.0]
 
-    m = len(A_groups)
     results = []
-
-    # Warm-start each p from the previous solution for faster convergence.
     x_prev = x0.copy()
 
     for p in sorted(p_values):
         if L is not None:
-            # Use ball-oracle with Lewis geometry.
             xnorm = max(float(np.linalg.norm(L @ x_prev)), 1.0)
             res = gp_ball_oracle_lewis(
                 A_groups, b_groups, x_prev, L=L, p=p,
@@ -322,15 +510,13 @@ def interpolation_path(
             )
 
         if res is None:
-            # Fall back to plain Newton if ball-oracle fails.
             res = gp_newton(A_groups, b_groups, x_prev, p=p, max_steps=max_steps)
 
         if res is not None:
             x_sol = res.x_final
             ell = _group_losses(A_groups, b_groups, x_sol)
             results.append({
-                "p": p,
-                "x": x_sol,
+                "p": p, "x": x_sol,
                 "gp_value": gp_value(A_groups, b_groups, x_sol, p),
                 "max_loss": float(ell.max()),
                 "avg_loss": float(ell.mean()),
