@@ -22,7 +22,7 @@ Requires: `numpy`, `matplotlib`, `cvxpy` (for exact solver), `pandas` (for CSV l
 python run_experiment.py
 ```
 
-This generates the adversarial heterogeneous instance from Appendix F, tunes all methods via grid search, and saves convergence plots to `iterations.png` and `time.png`.
+This generates the adversarial heterogeneous instance from Appendix F, tunes all methods via grid search, and saves all artifacts to a new timestamped directory under `runs/`.
 
 ### Custom synthetic parameters
 
@@ -37,6 +37,34 @@ python run_experiment.py --csv data.csv --target y --group group_id
 ```
 
 The CSV should have a target column, a group column, and feature columns (auto-detected if not specified with `--features`).
+
+### Run artifacts
+
+Every invocation creates a new directory `runs/<timestamp>[_<name>]/` containing a complete record of the run:
+
+```
+runs/20260419_152144_acs_all/
+├── config.json           # CLI args, dataset metadata, ERM/OPT baselines
+├── hyperparameters.json  # best-tuned hyperparameters for each method
+├── losses.csv            # per-group losses + aggregates (max, mean, std, max/mean)
+├── stats.json            # per-solver aggregate statistics
+├── summary.txt           # human-readable version of losses.csv
+├── solutions.npz         # parameter vectors x for every solver
+├── solutions_labels.json # map: sanitized NPZ key -> original solver label
+├── curves.npz            # per-iteration (iters, best_values, times) for both
+│                         #   iteration-budget and equal-runtime sweeps
+├── iterations.png        # convergence vs iterations (log scale)
+├── iterations_linear.png # convergence vs iterations (linear scale)
+├── time.png              # convergence vs wall-clock (log scale)
+└── time_linear.png       # convergence vs wall-clock (linear scale)
+```
+
+Customize the output location with `--runs-root` (default `runs/`) and `--run-name` (appended as a readable suffix):
+
+```bash
+python run_experiment.py --folktables --acs-all --run-name acs_all_v1
+# → writes to runs/20260419_152144_acs_all_v1/
+```
 
 ### Use as a library
 
@@ -77,6 +105,13 @@ for r in path:
 
 # Solve for a specific p value
 result = solvers.gp_newton(A_groups, b_groups, x0, p=8, max_steps=100)
+
+# Persist artifacts from a programmatic run
+run_dir = dro.artifacts.create_run_dir(name="my_experiment")
+dro.artifacts.save_hyperparameters(run_dir, configs)
+dro.artifacts.save_losses(run_dir, A_groups, b_groups,
+                           solutions={"ERM": x0, "my_solver": result.x_final})
+dro.artifacts.save_solutions(run_dir, solutions={"ERM": x0, "my_solver": result.x_final})
 ```
 
 ## Algorithms
@@ -106,6 +141,7 @@ dro/
 ├── lewis_weights.py     # Block Lewis weights and Lewis geometry (Theorem 2.3)
 ├── tuning.py            # Grid-search tuning for all methods
 ├── plotting.py          # Convergence and timing plots
+├── artifacts.py         # Run directory helpers (configs, losses, solutions, curves)
 └── solvers/
     ├── cvxpy_exact.py   # Exact CVXPY epigraph solver
     ├── subgradient.py   # Fixed and diminishing step subgradient
@@ -134,8 +170,10 @@ The task is to predict **log personal income** from 10 demographic and employmen
 We use **all 51 regions** (50 US states + Puerto Rico) with 200 samples per state, giving 10,200 total samples in 10 dimensions. The features are standardized to zero mean and unit variance.
 
 ```bash
-python run_experiment.py --folktables --acs-all --acs-subsample 200 --T 50
+python run_experiment.py --folktables --acs-all --acs-subsample 200 --T 50 --run-name acs_all
 ```
+
+This writes all artifacts (config, hyperparameters, losses, solutions, curves, plots) to `runs/<timestamp>_acs_all/`.
 
 ### Per-group loss comparison
 
