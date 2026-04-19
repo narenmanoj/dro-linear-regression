@@ -54,6 +54,10 @@ def make_parser() -> argparse.ArgumentParser:
                     help="Stop criterion: (max_loss - OPT) / OPT <= target.")
     p.add_argument("--T-cap", type=int, default=200,
                     help="Max iterations per solver (cap on iteration budget).")
+    p.add_argument("--max-solver-time", type=float, default=1.0,
+                    help="Hard wall-clock limit (seconds) per solver call. "
+                         "Prevents intrinsically slow methods (e.g. subgradient) "
+                         "from inflating total runtime.")
     p.add_argument("--n-trials", type=int, default=3,
                     help="Number of random subsets per m (results averaged).")
     p.add_argument("--seed", type=int, default=0)
@@ -143,11 +147,13 @@ def run_one_size(
 
     results = {}
 
+    tb = args.max_solver_time
+
     # Subgradient (diminishing).
     t0 = time.perf_counter()
     res = solvers.subgradient_diminishing(
         A_groups, b_groups, x0,
-        base_step=1e-5, T=args.T_cap,
+        base_step=1e-5, T=args.T_cap, time_budget=tb,
     )
     if res:
         results["Subgradient"] = {
@@ -161,7 +167,8 @@ def run_one_size(
     t0 = time.perf_counter()
     res = solvers.smooth_heavy_ball(
         A_groups, b_groups, x0,
-        beta=beta, delta=delta, step=1e-3, momentum=0.9, T=args.T_cap,
+        beta=beta, delta=delta, step=1e-3, momentum=0.9,
+        T=args.T_cap, time_budget=tb,
     )
     if res:
         results["Smoothed Heavy-Ball"] = {
@@ -175,7 +182,8 @@ def run_one_size(
     t0 = time.perf_counter()
     res = solvers.interior_point(
         A_groups, b_groups, x0,
-        mu0=1e-3, tau=0.5, inner_iters=3, max_newton_steps=args.T_cap,
+        mu0=1e-3, tau=0.5, inner_iters=3,
+        max_newton_steps=args.T_cap, time_budget=tb,
     )
     if res:
         results["IPM"] = {
@@ -191,7 +199,7 @@ def run_one_size(
         A_groups, b_groups, x0,
         beta=beta, delta=delta,
         R0=xnorm_euc, n_outer=args.T_cap, R_decay=0.9,
-        max_newton_steps=args.newton_steps,
+        max_newton_steps=args.newton_steps, time_budget=tb,
     )
     if res:
         results["Ball-Oracle (Euclidean)"] = {
@@ -207,7 +215,7 @@ def run_one_size(
         A_groups, b_groups, x0, L=L,
         beta=beta, delta=delta,
         R0=xnorm_lewis, n_outer=args.T_cap, R_decay=0.9,
-        max_newton_steps=args.newton_steps,
+        max_newton_steps=args.newton_steps, time_budget=tb,
     )
     if res:
         results["Ball-Oracle (Lewis)"] = {
