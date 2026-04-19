@@ -408,25 +408,43 @@ def main():
         json.dump(dro.artifacts._to_jsonable(sweep_results), f, indent=2)
 
     # Plots: m vs iterations, m vs time, with reference slopes.
+    # Both log-log and linear-scale versions.
     reference = {"m^(1/3)": 1.0 / 3.0, "m^(1/2)": 1.0 / 2.0}
+
     dro.plotting.plot_scaling(
         iter_data,
         ylabel="Iterations to reach target gap",
-        title=f"Scaling: iterations to relative gap ≤ {args.target_rel_gap}",
+        title=f"Scaling: iterations to relative gap ≤ {args.target_rel_gap} (log scale)",
         save_path=os.path.join(run_dir, "scaling_iters.png"),
+        log_scale=True,
+        reference_slopes=reference,
+    )
+    dro.plotting.plot_scaling(
+        iter_data,
+        ylabel="Iterations to reach target gap",
+        title=f"Scaling: iterations to relative gap ≤ {args.target_rel_gap} (linear scale)",
+        save_path=os.path.join(run_dir, "scaling_iters_linear.png"),
+        log_scale=False,
+    )
+    dro.plotting.plot_scaling(
+        time_data,
+        ylabel="Wall-clock time to target gap (s)",
+        title=f"Scaling: time to relative gap ≤ {args.target_rel_gap} (log scale)",
+        save_path=os.path.join(run_dir, "scaling_time.png"),
         log_scale=True,
         reference_slopes=reference,
     )
     dro.plotting.plot_scaling(
         time_data,
         ylabel="Wall-clock time to target gap (s)",
-        title=f"Scaling: time to relative gap ≤ {args.target_rel_gap}",
-        save_path=os.path.join(run_dir, "scaling_time.png"),
-        log_scale=True,
-        reference_slopes=reference,
+        title=f"Scaling: time to relative gap ≤ {args.target_rel_gap} (linear scale)",
+        save_path=os.path.join(run_dir, "scaling_time_linear.png"),
+        log_scale=False,
     )
 
     print(f"\nDone. Artifacts saved to: {run_dir}")
+    print("  Plots: scaling_iters.png, scaling_iters_linear.png,")
+    print("         scaling_time.png,  scaling_time_linear.png")
 
 
 if __name__ == "__main__":
