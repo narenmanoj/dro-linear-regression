@@ -70,8 +70,10 @@ def generate_hard_instance(
         b_groups.append(b_i)
 
     # --- Outlier groups: extreme curvature along distinct directions ---
+    # When m_outlier > d, we cycle through directions (multiple outliers share
+    # a direction but with independent sampling, noise, and target offsets).
     for j in range(m_outlier):
-        idx = d - 1 - j  # each outlier gets its own sharp direction
+        idx = (d - 1 - j) % d
         lambdas = np.ones(d)
         lambdas[idx] = cond_outlier
 

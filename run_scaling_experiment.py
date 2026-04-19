@@ -37,7 +37,14 @@ from dro.lewis_weights import build_lewis_geometry
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Scaling experiment: m vs iterations-to-accuracy.")
 
-    # Data.
+    # Data source (mutually exclusive).
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--synthetic", action="store_true",
+                      help="Use the synthetic adversarial instance (pool of generated groups).")
+    src.add_argument("--folktables", action="store_true", default=True,
+                      help="Use PUMA-grouped ACS income data (default).")
+
+    # Folktables (PUMA) options.
     p.add_argument("--acs-states", nargs="*", default=["CA"],
                     help="States to load PUMAs from (default: CA, gives ~265 PUMAs).")
     p.add_argument("--acs-all", action="store_true",
@@ -45,6 +52,18 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--acs-year", type=str, default="2018")
     p.add_argument("--samples-per-puma", type=int, default=50,
                     help="Fixed samples per PUMA (subsample within each group).")
+
+    # Synthetic-instance options.
+    p.add_argument("--syn-pool-m", type=int, default=2500,
+                    help="Total synthetic groups in the pool (subsets drawn from this).")
+    p.add_argument("--syn-outlier-frac", type=float, default=0.05,
+                    help="Fraction of pool groups that are adversarial outliers.")
+    p.add_argument("--syn-d", type=int, default=10,
+                    help="Dimension of the synthetic instance.")
+    p.add_argument("--syn-n-per-group", type=int, default=10,
+                    help="Samples per synthetic group.")
+    p.add_argument("--syn-seed", type=int, default=0,
+                    help="Seed for synthetic pool generation.")
 
     # Sweep.
     p.add_argument("--m-values", nargs="*", type=int,
@@ -240,22 +259,44 @@ def main():
     run_dir = dro.artifacts.create_run_dir(root=args.runs_root, name=args.run_name)
     print(f"Run directory: {run_dir}")
 
-    # Load the full PUMA-grouped dataset once.
-    if args.acs_all:
-        from dro.datasets_folktables import ALL_STATES
-        states = ALL_STATES
+    # Load or generate the full pool of groups once.
+    if args.synthetic:
+        m_outlier = int(round(args.syn_outlier_frac * args.syn_pool_m))
+        m_outlier = max(1, m_outlier)
+        print(f"Generating synthetic pool: m={args.syn_pool_m} "
+              f"({m_outlier} outliers), d={args.syn_d}, "
+              f"n_per_group={args.syn_n_per_group}")
+        A_groups_full, b_groups_full = dro.generate_hard_instance(
+            m_total=args.syn_pool_m,
+            m_outlier=m_outlier,
+            d=args.syn_d,
+            n_per_group=args.syn_n_per_group,
+            seed=args.syn_seed,
+        )
+        info = {
+            "n_groups": len(A_groups_full),
+            "d": A_groups_full[0].shape[1],
+            "n_total": sum(A.shape[0] for A in A_groups_full),
+            "source": "synthetic",
+        }
     else:
-        states = args.acs_states
+        if args.acs_all:
+            from dro.datasets_folktables import ALL_STATES
+            states = ALL_STATES
+        else:
+            states = args.acs_states
 
-    print(f"Loading ACS data for states: {states} ...")
-    A_groups_full, b_groups_full, info = dro.load_acs_income(
-        states=states,
-        survey_year=args.acs_year,
-        group_by="puma",
-        subsample=args.samples_per_puma,
-        min_group_size=args.samples_per_puma,  # keep only PUMAs with >= N samples
-    )
-    print(f"  Loaded {info['n_groups']} PUMAs, d={info['d']}, "
+        print(f"Loading ACS data for states: {states} ...")
+        A_groups_full, b_groups_full, info = dro.load_acs_income(
+            states=states,
+            survey_year=args.acs_year,
+            group_by="puma",
+            subsample=args.samples_per_puma,
+            min_group_size=args.samples_per_puma,
+        )
+        info["source"] = "folktables_puma"
+
+    print(f"  Pool: {info['n_groups']} groups, d={info['d']}, "
           f"n_total={info['n_total']}")
 
     # Filter requested m values to those <= available groups.
