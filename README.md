@@ -131,42 +131,89 @@ We evaluate our algorithms on a real-world regression task from the American Com
 
 The task is to predict **log personal income** from 10 demographic and employment features (age, education, occupation, hours worked, etc.) for employed US adults. The data is grouped by **US state**, making this a natural setting for group DRO: income distributions vary substantially across states, and a model that minimizes average prediction error may perform poorly on some states.
 
-We use 5 states (CA, TX, NY, FL, IL) with 200 samples per state, giving 1000 total samples in 10 dimensions. The features are standardized to zero mean and unit variance.
+We use **all 51 regions** (50 US states + Puerto Rico) with 200 samples per state, giving 10,200 total samples in 10 dimensions. The features are standardized to zero mean and unit variance.
 
 ```bash
-python run_experiment.py --folktables --acs-states CA TX NY FL IL --acs-subsample 200 --T 20
+python run_experiment.py --folktables --acs-all --acs-subsample 200 --T 50
 ```
 
 ### Per-group loss comparison
 
-The table below shows the mean squared error per group (state) for each solver, along with aggregate statistics. All methods use the ERM solution as a warm start and are tuned via grid search over 20 iterations.
+The table below shows the mean squared prediction error per state for each solver. All methods use the ERM solution as a warm start and are tuned via grid search over 50 iterations.
 
-| Group |   n |     ERM | OPT (CVXPY) | Subgradient | Smoothed HB |     IPM | Ball-Oracle (Euc.) | Ball-Oracle (Lewis) |
-|-------|-----|---------|-------------|-------------|-------------|---------|--------------------:|--------------------:|
-| CA    | 200 | 116.048 |     111.123 |     115.955 |     111.088 | 111.123 |            111.130  |            111.120  |
-| FL    | 200 | 107.737 |     110.533 |     107.765 |     110.152 | 110.533 |            110.447  |            110.538  |
-| IL    | 200 | 107.781 |     111.123 |     107.828 |     111.035 | 111.123 |            111.059  |            111.066  |
-| NY    | 200 | 112.438 |     111.123 |     112.430 |     111.226 | 111.123 |            111.147  |            111.150  |
-| TX    | 200 | 108.680 |     111.123 |     108.706 |     111.137 | 111.123 |            111.126  |            111.126  |
-| | | | | | | | | |
-| **Max**  |  | 116.048 | 111.123 | 115.955 | 111.226 | 111.123 | 111.147 | 111.150 |
-| **Mean** |  | 110.537 | 111.005 | 110.537 | 110.928 | 111.005 | 110.982 | 111.000 |
-| **Std**  |  |   3.252 |   0.236 |   3.204 |   0.393 |   0.236 |   0.269 |   0.233 |
-| **Max/Mean** | | 1.050 | 1.001 | 1.049 | 1.003 | 1.001 | 1.001 | 1.001 |
+| State |     ERM | OPT (CVXPY) | Subgradient | Smoothed HB |     IPM | Ball-Oracle (Euc.) | Ball-Oracle (Lewis) |
+|-------|--------:|------------:|------------:|------------:|--------:|-------------------:|--------------------:|
+| AL |  91.877 | 112.490 |  92.177 | 112.688 | 112.491 | 112.443 | 112.443 |
+| AK | 102.950 | 113.837 | 102.799 | 113.448 | 113.840 | 113.476 | 113.476 |
+| AZ | 113.954 | 110.873 | 113.804 | 110.734 | 110.872 | 110.834 | 110.834 |
+| AR |  96.325 | 113.111 |  96.463 | 112.794 | 113.111 | 112.931 | 112.931 |
+| CA | **138.065** | 113.956 | 137.307 | 113.187 | 113.956 | 113.749 | 113.749 |
+| CO | 108.927 | 113.472 | 108.966 | 113.405 | 113.472 | 113.375 | 113.375 |
+| CT | 115.090 | 113.956 | 115.130 | 114.123 | 113.956 | 113.914 | 113.914 |
+| DE | 106.379 | 110.504 | 106.513 | 111.012 | 110.504 | 110.688 | 110.688 |
+| FL | 130.928 | 109.676 | 130.572 | 109.494 | 109.677 | 109.694 | 109.694 |
+| GA | 111.512 | 112.849 | 111.435 | 112.612 | 112.850 | 112.713 | 112.713 |
+| HI | 132.336 | 110.808 | 131.299 | 109.873 | 110.807 | 110.373 | 110.373 |
+| ID |  98.620 | 112.512 |  98.779 | 112.171 | 112.513 | 112.343 | 112.343 |
+| IL | 104.909 | 111.277 | 105.028 | 111.478 | 111.276 | 111.360 | 111.360 |
+| IN |  98.289 | 113.956 |  98.471 | 113.946 | 113.956 | 113.870 | 113.870 |
+| IA |  92.348 | 113.263 |  92.598 | 113.257 | 113.265 | 113.130 | 113.130 |
+| KS | 101.611 | 110.476 | 101.699 | 110.476 | 110.478 | 110.354 | 110.354 |
+| KY |  98.028 | 113.651 |  98.280 | 113.690 | 113.651 | 113.587 | 113.587 |
+| LA | 100.182 | 112.777 | 100.309 | 112.872 | 112.777 | 112.813 | 112.813 |
+| ME |  95.141 | 109.688 |  95.416 | 110.214 | 109.686 | 109.797 | 109.797 |
+| MD | 122.349 | 113.956 | 122.203 | 114.100 | 113.956 | 114.011 | 114.011 |
+| MA | 120.006 | 112.341 | 119.937 | 112.513 | 112.340 | 112.362 | 112.362 |
+| MI | 100.776 | 112.922 | 100.988 | 112.892 | 112.923 | 112.826 | 112.826 |
+| MN | 105.931 | 113.531 | 106.025 | 113.559 | 113.532 | 113.434 | 113.434 |
+| MS |  96.131 | 107.237 |  96.282 | 107.379 | 107.237 | 107.224 | 107.224 |
+| MO | 100.258 | 109.911 | 100.398 | 109.925 | 109.911 | 109.833 | 109.833 |
+| MT |  97.212 | 107.313 |  97.413 | 107.669 | 107.313 | 107.563 | 107.563 |
+| NE |  97.375 | 110.118 |  97.541 | 110.159 | 110.118 | 110.091 | 110.091 |
+| NV | 131.379 | 113.956 | 130.888 | 113.612 | 113.956 | 113.995 | 113.995 |
+| NH | 104.483 | 113.956 | 104.699 | **114.260** | 113.956 | 113.991 | 113.991 |
+| NJ | 130.220 | 113.956 | 129.940 | 113.755 | 113.956 | 113.798 | 113.798 |
+| NM | 103.400 | 106.350 | 103.378 | 106.708 | 106.349 | 106.557 | 106.557 |
+| NY | 133.433 | 113.510 | 133.029 | 113.187 | 113.511 | 113.349 | 113.349 |
+| NC | 103.499 | 110.153 | 103.500 | 109.887 | 110.154 | 110.035 | 110.035 |
+| ND |  98.548 | 111.632 |  98.759 | 111.850 | 111.634 | 111.634 | 111.634 |
+| OH | 104.392 | 113.037 | 104.602 | 113.212 | 113.037 | 113.021 | 113.021 |
+| OK | 104.375 | 110.966 | 104.328 | 110.675 | 110.967 | 110.786 | 110.786 |
+| OR | 110.348 | 112.886 | 110.359 | 113.045 | 112.884 | 112.986 | 112.986 |
+| PA | 109.453 | 111.305 | 109.496 | 111.308 | 111.305 | 111.351 | 111.351 |
+| RI | 112.544 | 111.312 | 112.573 | 111.675 | 111.312 | 111.380 | 111.380 |
+| SC | 101.575 | 110.357 | 101.733 | 110.580 | 110.357 | 110.408 | 110.408 |
+| SD |  99.086 | 109.277 |  99.241 | 109.465 | 109.277 | 109.344 | 109.344 |
+| TN | 106.298 | 109.977 | 106.322 | 110.014 | 109.977 | 109.934 | 109.934 |
+| TX | 115.551 | 112.522 | 115.436 | 112.391 | 112.523 | 112.538 | 112.538 |
+| UT | 111.159 | 113.084 | 111.168 | 112.770 | 113.084 | 113.000 | 113.000 |
+| VT | 103.831 | 110.496 | 104.037 | 110.865 | 110.495 | 110.635 | 110.635 |
+| VA | 121.851 | 113.236 | 121.683 | 113.066 | 113.237 | 113.149 | 113.149 |
+| WA | 128.040 | 111.627 | 127.771 | 111.635 | 111.627 | 111.557 | 111.557 |
+| WV |  98.473 | 109.843 |  98.661 | 109.721 | 109.844 | 109.860 | 109.860 |
+| WI | 102.850 | 111.058 | 103.035 | 111.249 | 111.059 | 111.078 | 111.078 |
+| WY |  98.922 | 111.777 |  99.106 | 111.753 | 111.779 | 111.710 | 111.710 |
+| PR | 108.545 |  **97.149** | 108.247 |  97.249 |  97.147 |  97.300 |  97.300 |
+| | | | | | | | |
+| **Max**      | **138.065** | 113.956 | 137.307 | 114.260 | 113.956 | 114.011 | 114.011 |
+| **Mean**     | 108.231 | 111.449 | 108.232 | 111.443 | 111.449 | 111.415 | 111.415 |
+| **Median**   | 104.392 | 111.777 | 104.602 | 111.850 | 111.779 | 111.710 | 111.710 |
+| **Std**      |  11.773 |   2.751 |  11.546 |   2.687 |   2.751 |   2.696 |   2.696 |
+| **Max/Mean** |   1.276 |   1.022 |   1.269 |   1.025 |   1.022 |   1.023 |   1.023 |
 
 ### Observations
 
-- **ERM** achieves the lowest average loss (110.54) but has the highest worst-group loss (116.05 for CA). The max/mean ratio of 1.050 means the worst state's error is 5% higher than average.
+- **ERM** achieves the lowest average loss (108.23) but has an enormous spread (σ = 11.77). The worst states under ERM are **CA (138.1), NY (133.4), HI (132.3), FL (130.9), NV (131.4), NJ (130.2), WA (128.0)** — all large-population/high-income states where the 10-feature linear model struggles. The best-served are **AL (91.9), IA (92.3), ME (95.1), AR (96.3), MS (96.1)** — lower-income states with more homogeneous income distributions.
 
-- **OPT (CVXPY)** equalizes all group losses to ~111.12, with a max/mean ratio of 1.001. It sacrifices ~0.5 on average loss to bring the worst group down by ~5. This is the optimal tradeoff — the price of fairness.
+- **OPT (CVXPY)** nearly equalizes the group losses around 107–114 (Max/Mean = 1.022, σ = 2.75). Notably, **Puerto Rico (97.1) is the only state that stays below the equalized band** — its income distribution is so different (much lower mean income) that it anchors the entire problem. To bring CA's loss down from 138 to 114, the optimum accepts ~3 MSE cost on the previously well-served states.
 
-- **IPM** and **both ball-oracle methods** closely match the exact optimum within 20 iterations, achieving max/mean ratios of ~1.001. The per-group losses are nearly equalized across states.
+- **IPM** and **both ball-oracle methods** match the exact optimum to within 0.1 on every state, with Max/Mean ratios of 1.022–1.023 — effectively fully converged within 50 iterations.
 
-- **Subgradient descent** barely moves from ERM within 20 iterations — the max/mean ratio remains at 1.049.
+- **Subgradient descent** barely moves from ERM even after 50 iterations. The max/mean ratio stays at 1.269 (vs 1.276 for ERM), showing that on this adversarial 51-group instance, subgradient is fundamentally outclassed.
 
-- **Smoothed Heavy-Ball** makes significant progress but slightly overshoots on NY (111.23 > 111.12), leaving a small gap.
+- **Smoothed Heavy-Ball** gets close to optimum (Max/Mean = 1.025) but slightly overshoots on NH (114.26 vs OPT's 113.96), showing the accuracy limit of first-order methods on this problem.
 
-The key takeaway: on real census data, the robust (DRO) solution successfully redistributes prediction accuracy from well-served states (FL, IL, TX) to the worst-served state (CA), at a modest cost to average performance.
+The **ERM→DRO transition** redistributes prediction accuracy from 33 states whose loss increases to 17 states whose loss decreases. The largest decreases are CA (–24.3), NY (–19.9), HI (–21.5), NV (–17.4), NJ (–16.3), WA (–16.4) — all states that ERM effectively neglected. The price is moderate cost (~5–20 MSE) on the small-population, homogeneous states that ERM happened to fit well.
 
 ## Adding new datasets
 

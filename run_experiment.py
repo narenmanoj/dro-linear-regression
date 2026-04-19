@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import numpy as np
@@ -25,7 +24,6 @@ import numpy as np
 import dro
 from dro import solvers, tuning, plotting
 from dro.lewis_weights import build_lewis_geometry
-from dro.plotting import timed_run
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -51,6 +49,8 @@ def make_parser() -> argparse.ArgumentParser:
     # Folktables options.
     p.add_argument("--acs-states", nargs="*", default=None,
                     help="State abbreviations for Folktables (default: 10 most populous).")
+    p.add_argument("--acs-all", action="store_true",
+                    help="Use all 50 states + DC + PR for Folktables (overrides --acs-states).")
     p.add_argument("--acs-group-by", choices=["state", "race"], default="state",
                     help="Grouping for Folktables data.")
     p.add_argument("--acs-subsample", type=int, default=None,
@@ -69,7 +69,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--T", type=int, default=100, help="Iteration budget.")
     p.add_argument("--warm-start", choices=["erm", "zero", "rand"], default="erm")
     p.add_argument("--save-iterations", type=str, default="iterations.png")
+    p.add_argument("--save-iterations-linear", type=str, default="iterations_linear.png")
     p.add_argument("--save-time", type=str, default="time.png")
+    p.add_argument("--save-time-linear", type=str, default="time_linear.png")
     p.add_argument("--verbose", action="store_true")
 
     return p
@@ -89,13 +91,18 @@ def main():
         )
     elif args.folktables:
         print("Loading ACS income data from Folktables...")
+        if args.acs_all:
+            from dro.datasets_folktables import ALL_STATES
+            states = ALL_STATES
+        else:
+            states = args.acs_states
         A_groups, b_groups, acs_info = dro.load_acs_income(
-            states=args.acs_states,
+            states=states,
             survey_year=args.acs_year,
             group_by=args.acs_group_by,
             subsample=args.acs_subsample,
         )
-        print(f"  Groups: {acs_info['group_names']}")
+        print(f"  Groups ({acs_info['n_groups']}): {acs_info['group_names']}")
     else:
         print("Generating synthetic adversarial instance...")
         A_groups, b_groups = dro.generate_hard_instance(
@@ -255,89 +262,127 @@ def main():
     print()
 
     # ------------------------------------------------------------------
-    # 8. Plot iterations
+    # 8. Plot iterations (log + linear)
     # ------------------------------------------------------------------
     print("Plotting iteration convergence...")
     plotting.plot_convergence(
         curves, F_opt=F_opt, F_erm=F_erm,
-        title="Convergence on Max-Loss (0-{} iterations)".format(args.T),
+        title="Convergence on Max-Loss (0-{} iterations, log scale)".format(args.T),
         save_path=args.save_iterations,
+        log_scale=True,
+    )
+    plotting.plot_convergence(
+        curves, F_opt=F_opt, F_erm=F_erm,
+        title="Convergence on Max-Loss (0-{} iterations, linear scale)".format(args.T),
+        save_path=args.save_iterations_linear,
+        log_scale=False,
     )
 
     # ------------------------------------------------------------------
-    # 8. Timed runs and plot
+    # 8. Equal-runtime comparison
     # ------------------------------------------------------------------
-    print("Running timed comparisons...")
+    # Use the runtime of the slowest method (from step 6) as the shared
+    # time budget. Each method gets enough iterations (up to a large cap)
+    # to fill that budget, and fast methods exit early when it's up.
+    slowest = 0.0
+    for label, result in curves.items():
+        if result.times:
+            slowest = max(slowest, result.times[-1])
+    time_budget = max(slowest, 1e-3)
+    # Generous iteration cap — let fast methods iterate freely until time runs out.
+    big_T = max(args.T * 1000, 100000)
+
+    print(f"\nRunning equal-runtime comparison (budget = {time_budget*1000:.2f} ms)...")
     timed_curves = {}
 
     cfg, _ = configs["subgradient"]
     if cfg:
         if cfg["mode"] == "fixed":
-            res, rt = timed_run(solvers.subgradient_fixed, A_groups, b_groups, x0,
-                                step=cfg["step"], T=args.T)
+            res = solvers.subgradient_fixed(A_groups, b_groups, x0,
+                                             step=cfg["step"], T=big_T,
+                                             time_budget=time_budget)
             label = "Subgradient (fixed)"
         else:
-            res, rt = timed_run(solvers.subgradient_diminishing, A_groups, b_groups, x0,
-                                base_step=cfg["base_step"], T=args.T)
+            res = solvers.subgradient_diminishing(A_groups, b_groups, x0,
+                                                    base_step=cfg["base_step"],
+                                                    T=big_T, time_budget=time_budget)
             label = "Subgradient (diminishing)"
         if res:
-            timed_curves[label] = (res, rt)
+            timed_curves[label] = res
+            print(f"  {label}: {len(res.iters)-1} iters in {res.times[-1]*1000:.1f} ms")
 
     cfg, _ = configs["smooth"]
     if cfg:
         variant = cfg["variant"]
-        common = dict(beta=cfg["beta"], delta=cfg["delta"], step=cfg["step"], T=args.T)
+        common = dict(beta=cfg["beta"], delta=cfg["delta"], step=cfg["step"],
+                      T=big_T, time_budget=time_budget)
         if variant == "gd":
-            res, rt = timed_run(solvers.smooth_gd, A_groups, b_groups, x0, **common)
+            res = solvers.smooth_gd(A_groups, b_groups, x0, **common)
             label = "Smoothed GD"
         elif variant == "heavy_ball":
-            res, rt = timed_run(solvers.smooth_heavy_ball, A_groups, b_groups, x0,
-                                momentum=cfg["momentum"], **common)
+            res = solvers.smooth_heavy_ball(A_groups, b_groups, x0,
+                                             momentum=cfg["momentum"], **common)
             label = "Smoothed Heavy-Ball"
         else:
-            res, rt = timed_run(solvers.smooth_nesterov, A_groups, b_groups, x0,
-                                momentum=cfg["momentum"], **common)
+            res = solvers.smooth_nesterov(A_groups, b_groups, x0,
+                                           momentum=cfg["momentum"], **common)
             label = "Smoothed Nesterov"
         if res:
-            timed_curves[label] = (res, rt)
+            timed_curves[label] = res
+            print(f"  {label}: {len(res.iters)-1} iters in {res.times[-1]*1000:.1f} ms")
 
     cfg, _ = configs["ipm"]
     if cfg:
-        res, rt = timed_run(solvers.interior_point, A_groups, b_groups, x0,
-                            mu0=cfg["mu0"], tau=cfg["tau"],
-                            inner_iters=cfg["inner_iters"],
-                            max_newton_steps=args.T)
+        res = solvers.interior_point(A_groups, b_groups, x0,
+                                      mu0=cfg["mu0"], tau=cfg["tau"],
+                                      inner_iters=cfg["inner_iters"],
+                                      max_newton_steps=big_T,
+                                      time_budget=time_budget)
         if res:
-            timed_curves["IPM"] = (res, rt)
+            timed_curves["IPM"] = res
+            print(f"  IPM: {len(res.iters)-1} iters in {res.times[-1]*1000:.1f} ms")
 
     cfg, _ = configs["ball_oracle_naive"]
     if cfg:
-        res, rt = timed_run(solvers.ball_oracle_naive, A_groups, b_groups, x0,
-                            beta=cfg["beta"], delta=cfg["delta"],
-                            R0=cfg["R0"], n_outer=cfg["n_outer"],
-                            R_decay=cfg["R_decay"],
-                            max_newton_steps=cfg["max_newton_steps"])
+        res = solvers.ball_oracle_naive(A_groups, b_groups, x0,
+                                         beta=cfg["beta"], delta=cfg["delta"],
+                                         R0=cfg["R0"], n_outer=big_T,
+                                         R_decay=cfg["R_decay"],
+                                         max_newton_steps=cfg["max_newton_steps"],
+                                         time_budget=time_budget)
         if res:
-            timed_curves["Ball-Oracle (Euclidean)"] = (res, rt)
+            timed_curves["Ball-Oracle (Euclidean)"] = res
+            print(f"  Ball-Oracle (Euclidean): {len(res.iters)-1} iters in {res.times[-1]*1000:.1f} ms")
 
     if "ball_oracle_lewis" in configs:
         cfg, _ = configs["ball_oracle_lewis"]
         if cfg:
-            res, rt = timed_run(solvers.ball_oracle_lewis, A_groups, b_groups, x0,
-                                L=L_lewis, beta=cfg["beta"], delta=cfg["delta"],
-                                R0=cfg["R0"], n_outer=cfg["n_outer"],
-                                R_decay=cfg["R_decay"],
-                                max_newton_steps=cfg["max_newton_steps"])
+            res = solvers.ball_oracle_lewis(A_groups, b_groups, x0, L=L_lewis,
+                                             beta=cfg["beta"], delta=cfg["delta"],
+                                             R0=cfg["R0"], n_outer=big_T,
+                                             R_decay=cfg["R_decay"],
+                                             max_newton_steps=cfg["max_newton_steps"],
+                                             time_budget=time_budget)
             if res:
-                timed_curves["Ball-Oracle (Lewis)"] = (res, rt)
+                timed_curves["Ball-Oracle (Lewis)"] = res
+                print(f"  Ball-Oracle (Lewis): {len(res.iters)-1} iters in {res.times[-1]*1000:.1f} ms")
 
     plotting.plot_time_vs_accuracy(
         timed_curves, F_opt=F_opt, F_erm=F_erm,
-        title="Time vs Accuracy (best tuned methods)",
+        title=f"Time vs Accuracy (equal {time_budget*1000:.1f} ms budget, log scale)",
         save_path=args.save_time,
+        log_scale=True,
+    )
+    plotting.plot_time_vs_accuracy(
+        timed_curves, F_opt=F_opt, F_erm=F_erm,
+        title=f"Time vs Accuracy (equal {time_budget*1000:.1f} ms budget, linear scale)",
+        save_path=args.save_time_linear,
+        log_scale=False,
     )
 
-    print("\nDone. Plots saved to", args.save_iterations, "and", args.save_time)
+    print("\nDone. Plots saved to:")
+    print(f"  {args.save_iterations}, {args.save_iterations_linear}")
+    print(f"  {args.save_time}, {args.save_time_linear}")
 
 
 if __name__ == "__main__":

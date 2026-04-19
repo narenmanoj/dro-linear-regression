@@ -22,6 +22,7 @@ Each ball-oracle variant supports an `accelerated` toggle:
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -260,8 +261,10 @@ def _proximal_oracle_gp(
 def _run_gp_ball_oracle_naive(
     A_groups, b_groups, x0, p,
     R0, n_outer, R_decay, max_newton_steps, project_fn_factory,
+    time_budget=None,
 ):
     """Naive outer loop: iterate ball oracle calls with shrinking radius."""
+    start = time.perf_counter()
     x = x0.copy()
     center = x0.copy()
     R = float(R0)
@@ -272,7 +275,7 @@ def _run_gp_ball_oracle_naive(
     explode = 1e6 * max(Fp_init, 1.0)
 
     best = Fp_init
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for k in range(1, n_outer + 1):
         project_fn = project_fn_factory(center, R)
@@ -291,16 +294,21 @@ def _run_gp_ball_oracle_naive(
             return None
 
         best = min(best, Fp)
+        elapsed = time.perf_counter() - start
         iters.append(k)
         best_vals.append(best)
+        times.append(elapsed)
 
         R *= R_decay
         if R <= 0:
             break
 
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
     return SolverResult(
         x_final=x, best_loss=best,
-        iters=iters, best_values=best_vals,
+        iters=iters, best_values=best_vals, times=times,
         info={"p": p, "method": "ball_oracle"},
     )
 
@@ -308,28 +316,18 @@ def _run_gp_ball_oracle_naive(
 def _run_gp_accelerated(
     A_groups, b_groups, x0, p, n_outer, M,
     max_newton_steps=20,
+    time_budget=None,
 ):
-    """MS-accelerated outer loop for 2 <= p < inf (Algorithm 5, lines 3-4).
-
-    Uses a proximal oracle (Algorithm 4 / Eq. 8) wrapped into an MS oracle,
-    then runs Algorithm 3 (OptimalMSAcceleration) for the outer iterations.
-
-    The proximal subproblem is:
-        min f(x) + C_p ||x - q||_M^p
-    where C_p = e * p^{p+1}, giving a (p-1, C_p^{1/(p-1)})-movement bound.
-    """
-    # Build proximal oracle callable.
+    """MS-accelerated outer loop for 2 <= p < inf (Algorithm 5, lines 3-4)."""
     def proximal_fn(q, Cp):
         return _proximal_oracle_gp(
             A_groups, b_groups, q, Cp, p, M,
             max_newton_steps=max_newton_steps,
         )
 
-    # Gradient of f_p for the v-update in Algorithm 3.
     def f_grad(x):
         return gp_power_grad(A_groups, b_groups, x, p)
 
-    # Build MS oracle from proximal oracle (Algorithm 4 / Lemma D.20).
     ms_oracle = make_ms_oracle_gp(
         proximal_oracle_fn=proximal_fn,
         f_grad=f_grad,
@@ -337,27 +335,26 @@ def _run_gp_accelerated(
         p=p,
     )
 
-    # Value function for tracking.
     def f_value(x):
         return gp_power_value(A_groups, b_groups, x, p)
 
-    # Run Algorithm 3 with s = p - 1 (movement bound order for finite p).
-    iterates = ms_accelerate(
+    iterates, ms_times = ms_accelerate(
         f_value=f_value,
         f_grad=f_grad,
         ms_oracle=ms_oracle,
         x0=x0,
         M=M,
         T=n_outer,
-        s=p - 1,  # finite-p movement bound
+        s=p - 1,
+        time_budget=time_budget,
     )
 
-    # Convert iterates to SolverResult, tracking best Gp value.
     best = gp_value(A_groups, b_groups, x0, p)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
     x_best = x0.copy()
 
-    for k, x_k in enumerate(iterates[1:], 1):
+    for k in range(1, len(iterates)):
+        x_k = iterates[k]
         if not np.all(np.isfinite(x_k)):
             continue
         Fp = gp_value(A_groups, b_groups, x_k, p)
@@ -366,10 +363,11 @@ def _run_gp_accelerated(
             x_best = x_k.copy()
         iters.append(k)
         best_vals.append(best)
+        times.append(ms_times[k])
 
     return SolverResult(
         x_final=x_best, best_loss=best,
-        iters=iters, best_values=best_vals,
+        iters=iters, best_values=best_vals, times=times,
         info={"p": p, "method": "ball_oracle_accelerated"},
     )
 
@@ -388,6 +386,7 @@ def gp_ball_oracle_naive(
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
     accelerated: bool = False,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Ball-oracle method for Gp objective with Euclidean geometry.
 
@@ -397,6 +396,7 @@ def gp_ball_oracle_naive(
         accelerated: If True, uses MS acceleration (Algorithm 3 + Algorithm 4)
             with the proximal oracle from Eq. 8. R0 and R_decay are ignored;
             the proximal regularization handles convergence.
+        time_budget: If set, stop after this many wall-clock seconds.
     """
     if accelerated:
         d = A_groups[0].shape[1]
@@ -404,6 +404,7 @@ def gp_ball_oracle_naive(
         return _run_gp_accelerated(
             A_groups, b_groups, x0, p, n_outer, M,
             max_newton_steps=max_newton_steps,
+            time_budget=time_budget,
         )
     else:
         def factory(center, R):
@@ -411,6 +412,7 @@ def gp_ball_oracle_naive(
         return _run_gp_ball_oracle_naive(
             A_groups, b_groups, x0, p,
             R0, n_outer, R_decay, max_newton_steps, factory,
+            time_budget=time_budget,
         )
 
 
@@ -425,6 +427,7 @@ def gp_ball_oracle_lewis(
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
     accelerated: bool = False,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Ball-oracle method for Gp objective with Lewis geometry (Algorithm 5).
 
@@ -434,17 +437,16 @@ def gp_ball_oracle_lewis(
 
     Args:
         L: Cholesky factor from lewis_weights.build_lewis_geometry(p=p).
-           Note: for best results, Lewis weights should be computed with the
-           same p as the objective.
         accelerated: If True, uses MS acceleration (Algorithm 3 + Algorithm 4)
-            with the proximal oracle from Eq. 8. R0 and R_decay are ignored;
-            the proximal regularization handles convergence.
+            with the proximal oracle from Eq. 8. R0 and R_decay are ignored.
+        time_budget: If set, stop after this many wall-clock seconds.
     """
     if accelerated:
         M = L.T @ L
         return _run_gp_accelerated(
             A_groups, b_groups, x0, p, n_outer, M,
             max_newton_steps=max_newton_steps,
+            time_budget=time_budget,
         )
     else:
         def factory(center, R):
@@ -452,6 +454,7 @@ def gp_ball_oracle_lewis(
         return _run_gp_ball_oracle_naive(
             A_groups, b_groups, x0, p,
             R0, n_outer, R_decay, max_newton_steps, factory,
+            time_budget=time_budget,
         )
 
 

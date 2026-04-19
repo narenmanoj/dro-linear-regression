@@ -20,6 +20,8 @@ Two geometry choices:
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..problem import SolverResult, max_group_loss
@@ -108,8 +110,10 @@ def _project_euclidean(center, R, x_trial):
 def _run_ball_oracle_naive(
     A_groups, b_groups, x0, beta, delta,
     R0, n_outer, R_decay, max_newton_steps, project_fn_factory,
+    time_budget=None,
 ):
     """Naive outer loop: iterate ball oracle calls with shrinking radius."""
+    start = time.perf_counter()
     x = x0.copy()
     center = x0.copy()
     R = float(R0)
@@ -120,7 +124,7 @@ def _run_ball_oracle_naive(
     explode = 1e6 * max(F_init, 1.0)
 
     best = F_init
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for k in range(1, n_outer + 1):
         project_fn = project_fn_factory(center, R)
@@ -139,14 +143,20 @@ def _run_ball_oracle_naive(
             return None
 
         best = min(best, F_true)
+        elapsed = time.perf_counter() - start
         iters.append(k)
         best_vals.append(best)
+        times.append(elapsed)
 
         R *= R_decay
         if R <= 0:
             break
 
-    return SolverResult(x_final=x, best_loss=best, iters=iters, best_values=best_vals)
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
+    return SolverResult(x_final=x, best_loss=best,
+                         iters=iters, best_values=best_vals, times=times)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +166,7 @@ def _run_ball_oracle_naive(
 def _run_ball_oracle_accelerated(
     A_groups, b_groups, x0, beta, delta,
     radius, n_outer, max_newton_steps, project_fn_factory, M,
+    time_budget=None,
 ):
     """MS-accelerated outer loop for p=inf (Algorithm 1, lines 7-9).
 
@@ -165,8 +176,8 @@ def _run_ball_oracle_accelerated(
     Args:
         radius: Fixed ball radius for all oracle calls (r = C/eps from Alg. 1 line 7).
         M: Geometry matrix (L^T L for Lewis, or I for naive).
+        time_budget: If set, stop after this many wall-clock seconds.
     """
-    # Build the inner ball oracle callable.
     def ball_oracle_call(center, R):
         project_fn = project_fn_factory(center, R)
         return _newton_ball_oracle(
@@ -174,12 +185,10 @@ def _run_ball_oracle_accelerated(
             max_newton_steps, project_fn,
         )
 
-    # Gradient of the smoothed objective for the v-update in Algorithm 3.
     def f_grad(x):
         _, g = smooth_value_and_grad(A_groups, b_groups, x, beta, delta)
         return g
 
-    # Build MS oracle from ball oracle (Carmon et al., 2020, Proposition 5).
     ms_oracle = make_ms_oracle_robust(
         ball_oracle_fn=ball_oracle_call,
         f_grad=f_grad,
@@ -187,27 +196,27 @@ def _run_ball_oracle_accelerated(
         radius=radius,
     )
 
-    # Value function for tracking.
     def f_value(x):
         return smooth_value(A_groups, b_groups, x, beta, delta)
 
-    # Run Algorithm 3 (OptimalMSAcceleration).
-    iterates = ms_accelerate(
+    iterates, ms_times = ms_accelerate(
         f_value=f_value,
         f_grad=f_grad,
         ms_oracle=ms_oracle,
         x0=x0,
         M=M,
         T=n_outer,
-        s=np.inf,  # p = inf => s = inf movement bound
+        s=np.inf,
+        time_budget=time_budget,
     )
 
     # Convert iterates to SolverResult, tracking best true max-loss.
     best = max_group_loss(A_groups, b_groups, x0)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
     x_best = x0.copy()
 
-    for k, x_k in enumerate(iterates[1:], 1):
+    for k in range(1, len(iterates)):
+        x_k = iterates[k]
         if not np.all(np.isfinite(x_k)):
             continue
         F_true = max_group_loss(A_groups, b_groups, x_k)
@@ -216,8 +225,10 @@ def _run_ball_oracle_accelerated(
             x_best = x_k.copy()
         iters.append(k)
         best_vals.append(best)
+        times.append(ms_times[k])
 
-    return SolverResult(x_final=x_best, best_loss=best, iters=iters, best_values=best_vals)
+    return SolverResult(x_final=x_best, best_loss=best,
+                         iters=iters, best_values=best_vals, times=times)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +246,7 @@ def ball_oracle_naive(
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
     accelerated: bool = False,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Ball-oracle method with Euclidean (naive) geometry.
 
@@ -245,6 +257,7 @@ def ball_oracle_naive(
         accelerated: If True, uses MS acceleration (Algorithm 3) instead of
             naive repeated iteration. When accelerated, R0 is used as the
             fixed ball radius and R_decay is ignored.
+        time_budget: If set, stop after this many wall-clock seconds.
     """
     def factory(center, R):
         return lambda x_trial: _project_euclidean(center, R, x_trial)
@@ -257,11 +270,13 @@ def ball_oracle_naive(
             radius=R0, n_outer=n_outer,
             max_newton_steps=max_newton_steps,
             project_fn_factory=factory, M=M,
+            time_budget=time_budget,
         )
     else:
         return _run_ball_oracle_naive(
             A_groups, b_groups, x0, beta, delta,
             R0, n_outer, R_decay, max_newton_steps, factory,
+            time_budget=time_budget,
         )
 
 
@@ -277,6 +292,7 @@ def ball_oracle_lewis(
     R_decay: float = 0.9,
     max_newton_steps: int = 5,
     accelerated: bool = False,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Ball-oracle method with Lewis-weighted geometry (Algorithm 1).
 
@@ -290,6 +306,7 @@ def ball_oracle_lewis(
         accelerated: If True, uses MS acceleration (Algorithm 3) instead of
             naive repeated iteration. When accelerated, R0 is used as the
             fixed ball radius and R_decay is ignored.
+        time_budget: If set, stop after this many wall-clock seconds.
     """
     def factory(center, R):
         return lambda x_trial: project_onto_lewis_ball(x_trial, center, R, L)
@@ -301,9 +318,11 @@ def ball_oracle_lewis(
             radius=R0, n_outer=n_outer,
             max_newton_steps=max_newton_steps,
             project_fn_factory=factory, M=M,
+            time_budget=time_budget,
         )
     else:
         return _run_ball_oracle_naive(
             A_groups, b_groups, x0, beta, delta,
             R0, n_outer, R_decay, max_newton_steps, factory,
+            time_budget=time_budget,
         )

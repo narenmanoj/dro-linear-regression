@@ -23,6 +23,7 @@ Both modes use Algorithm 3 (OptimalMSAcceleration) as the outer loop.
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -36,7 +37,8 @@ def ms_accelerate(
     T: int,
     s: float = np.inf,
     sigma: float = 0.5,
-) -> list[np.ndarray]:
+    time_budget: float | None = None,
+) -> tuple[list[np.ndarray], list[float]]:
     """Run Algorithm 3 (OptimalMSAcceleration).
 
     This is the outer acceleration loop that takes an MS oracle and iterates
@@ -54,10 +56,14 @@ def ms_accelerate(
         T: Number of outer iterations.
         s: Movement bound order. s=inf for p=inf case, s=p-1 for finite p.
         sigma: MS oracle quality parameter (< 1).
+        time_budget: If set, stop after this many wall-clock seconds.
 
     Returns:
-        List of iterates [x0, x1, ..., xT].
+        (iterates, times) where iterates is a list [x0, x1, ..., xT] and
+        times is the list of elapsed wall-clock seconds for each iterate
+        (both of the same length).
     """
+    start = time.perf_counter()
     d = len(x0)
 
     # Precompute M^{-1} for the v update.
@@ -83,6 +89,7 @@ def ms_accelerate(
     lambda_prime = lambda_val
 
     iterates = [x0.copy()]
+    times = [0.0]
 
     for t in range(T):
         # Line 4: a'_{t+1}
@@ -151,8 +158,13 @@ def ms_accelerate(
         lambda_val = lambda_new
 
         iterates.append(x.copy())
+        elapsed = time.perf_counter() - start
+        times.append(elapsed)
 
-    return iterates
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
+    return iterates, times
 
 
 # ---------------------------------------------------------------------------

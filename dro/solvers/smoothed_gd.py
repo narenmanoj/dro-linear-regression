@@ -11,19 +11,22 @@ All methods track the true (nonsmooth) max-group loss as the evaluation metric.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..problem import SolverResult, max_group_loss
 from ..smoothing import smooth_value_and_grad
 
 
-def _check_and_record(F_true, best, explode, iters, best_vals, t):
+def _check_and_record(F_true, best, explode, iters, best_vals, times, t, elapsed):
     """Check for divergence and record progress. Returns (new_best, ok)."""
     if not np.isfinite(F_true) or F_true > explode:
         return best, False
     best = min(best, F_true)
     iters.append(t)
     best_vals.append(best)
+    times.append(elapsed)
     return best, True
 
 
@@ -35,16 +38,18 @@ def smooth_gd(
     delta: float,
     step: float,
     T: int = 100,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Plain gradient descent on the smoothed objective.
 
     Returns None on divergence or numerical failure.
     """
+    start = time.perf_counter()
     x = x0.copy()
     F_init = max_group_loss(A_groups, b_groups, x)
     best = F_init
     explode = 1e6 * max(F_init, 1.0)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for t in range(1, T + 1):
         _, g = smooth_value_and_grad(A_groups, b_groups, x, beta, delta)
@@ -56,11 +61,16 @@ def smooth_gd(
             return None
 
         F_true = max_group_loss(A_groups, b_groups, x)
-        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, t)
+        elapsed = time.perf_counter() - start
+        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, times, t, elapsed)
         if not ok:
             return None
 
-    return SolverResult(x_final=x, best_loss=best, iters=iters, best_values=best_vals)
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
+    return SolverResult(x_final=x, best_loss=best,
+                         iters=iters, best_values=best_vals, times=times)
 
 
 def smooth_heavy_ball(
@@ -72,6 +82,7 @@ def smooth_heavy_ball(
     step: float,
     momentum: float,
     T: int = 100,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Heavy-Ball momentum on the smoothed objective.
 
@@ -79,12 +90,13 @@ def smooth_heavy_ball(
 
     Returns None on divergence or numerical failure.
     """
+    start = time.perf_counter()
     x = x0.copy()
     v = np.zeros_like(x)
     F_init = max_group_loss(A_groups, b_groups, x)
     best = F_init
     explode = 1e6 * max(F_init, 1.0)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for t in range(1, T + 1):
         _, g = smooth_value_and_grad(A_groups, b_groups, x, beta, delta)
@@ -97,11 +109,16 @@ def smooth_heavy_ball(
             return None
 
         F_true = max_group_loss(A_groups, b_groups, x)
-        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, t)
+        elapsed = time.perf_counter() - start
+        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, times, t, elapsed)
         if not ok:
             return None
 
-    return SolverResult(x_final=x, best_loss=best, iters=iters, best_values=best_vals)
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
+    return SolverResult(x_final=x, best_loss=best,
+                         iters=iters, best_values=best_vals, times=times)
 
 
 def smooth_nesterov(
@@ -113,6 +130,7 @@ def smooth_nesterov(
     step: float,
     momentum: float,
     T: int = 100,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Nesterov accelerated gradient on the smoothed objective.
 
@@ -121,12 +139,13 @@ def smooth_nesterov(
 
     Returns None on divergence or numerical failure.
     """
+    start = time.perf_counter()
     x = x0.copy()
     v = np.zeros_like(x)
     F_init = max_group_loss(A_groups, b_groups, x)
     best = F_init
     explode = 1e6 * max(F_init, 1.0)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for t in range(1, T + 1):
         y = x - momentum * v
@@ -140,8 +159,13 @@ def smooth_nesterov(
             return None
 
         F_true = max_group_loss(A_groups, b_groups, x)
-        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, t)
+        elapsed = time.perf_counter() - start
+        best, ok = _check_and_record(F_true, best, explode, iters, best_vals, times, t, elapsed)
         if not ok:
             return None
 
-    return SolverResult(x_final=x, best_loss=best, iters=iters, best_values=best_vals)
+        if time_budget is not None and elapsed >= time_budget:
+            break
+
+    return SolverResult(x_final=x, best_loss=best,
+                         iters=iters, best_values=best_vals, times=times)

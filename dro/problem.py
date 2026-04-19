@@ -24,6 +24,8 @@ class SolverResult:
         best_loss: The best (lowest) true max-group loss seen along the trajectory.
         iters: Iteration indices at which losses were recorded (length T+1, starting at 0).
         best_values: Best-so-far true max-group loss at each recorded iteration.
+        times: Wall-clock seconds since solver start, at each recorded iteration.
+            None if the solver was not run with time tracking.
         info: Solver-specific extra information (e.g. IPM barrier variable t).
     """
 
@@ -31,6 +33,7 @@ class SolverResult:
     best_loss: float
     iters: Optional[list[int]] = None
     best_values: Optional[list[float]] = None
+    times: Optional[list[float]] = None
     info: Optional[dict] = None
 
 

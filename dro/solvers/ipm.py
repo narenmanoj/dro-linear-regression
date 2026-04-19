@@ -14,6 +14,8 @@ This is the standard IPM baseline from (Boyd & Vandenberghe, 2004, Section 6.4).
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..problem import (
@@ -85,6 +87,7 @@ def interior_point(
     max_newton_steps: int = 100,
     backtrack_beta: float = 0.5,
     backtrack_c: float = 1e-4,
+    time_budget: float | None = None,
 ) -> SolverResult | None:
     """Log-barrier interior-point method.
 
@@ -96,9 +99,11 @@ def interior_point(
         max_newton_steps: Total Newton step budget.
         backtrack_beta: Line search shrinkage factor.
         backtrack_c: Armijo sufficient decrease constant.
+        time_budget: If set, stop after this many wall-clock seconds.
 
     Returns None on numerical failure.
     """
+    start = time.perf_counter()
     d = A_groups[0].shape[1]
     x = x0.copy()
 
@@ -116,7 +121,7 @@ def interior_point(
 
     best = F_true
     explode = 1e6 * max(F_true, 1.0)
-    iters, best_vals = [0], [best]
+    iters, best_vals, times = [0], [best], [0.0]
 
     for k in range(1, max_newton_steps + 1):
         # Barrier value for line search reference.
@@ -166,16 +171,22 @@ def interior_point(
             return None
 
         best = min(best, F_true)
+        elapsed = time.perf_counter() - start
         iters.append(k)
         best_vals.append(best)
+        times.append(elapsed)
 
         if k % inner_iters == 0:
             mu *= tau
+
+        if time_budget is not None and elapsed >= time_budget:
+            break
 
     return SolverResult(
         x_final=x,
         best_loss=best,
         iters=iters,
         best_values=best_vals,
+        times=times,
         info={"t_final": t},
     )

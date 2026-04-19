@@ -3,6 +3,10 @@
 Generates:
   - Iteration-based convergence plots (best-so-far max-loss - OPT vs iterations)
   - Wall-clock time vs accuracy plots
+  - Interpolation path plots (Gp tradeoff)
+
+Each convergence plot supports both log-scale and linear-scale x-axes via
+the `log_scale` parameter.
 """
 
 from __future__ import annotations
@@ -29,14 +33,16 @@ def plot_convergence(
     F_erm: float | None = None,
     title: str = "Convergence on Max-Loss Objective",
     save_path: str | None = None,
+    log_scale: bool = True,
 ):
-    """Plot iteration-based convergence curves (log scale x-axis).
+    """Plot iteration-based convergence curves.
 
     Args:
         curves: {label: SolverResult} for each method.
         F_opt: Optimal value to subtract (if None, plots raw losses).
         F_erm: ERM baseline value (shown as horizontal dashed line).
         save_path: If provided, saves the figure to this path.
+        log_scale: If True, use log scale on x-axis. If False, use linear.
     """
     baseline = F_opt if (F_opt is not None and np.isfinite(F_opt)) else 0.0
 
@@ -47,6 +53,7 @@ def plot_convergence(
         ax.axhline(y=gap, linestyle="--", linewidth=1.5, color="gray",
                     label=f"ERM - OPT ({gap:.2e})")
 
+    max_iter = 0
     for label, result in curves.items():
         if result.iters is None or result.best_values is None:
             continue
@@ -58,16 +65,26 @@ def plot_convergence(
         if iters.size == 0:
             continue
 
+        max_iter = max(max_iter, iters.max())
         vals_shifted = np.maximum(vals - baseline, 1e-16)
-        x_plot = iters + 1.0  # shift for log scale
+
+        if log_scale:
+            x_plot = iters + 1.0  # shift so t=0 maps to x=1
+        else:
+            x_plot = iters
 
         marker = "o" if len(x_plot) <= 40 else None
         ax.plot(x_plot, vals_shifted, label=label, linewidth=2.0,
                 marker=marker, markersize=4 if marker else 0)
 
-    ax.set_xscale("log")
-    ax.set_xlim(left=1.0, right=max(iters.max() + 1, 101.0) if len(curves) > 0 else 101.0)
-    ax.set_xlabel("Iterations (log scale)")
+    scale_label = "log" if log_scale else "linear"
+    if log_scale:
+        ax.set_xscale("log")
+        ax.set_xlim(left=1.0, right=max(max_iter + 1, 101.0))
+    else:
+        ax.set_xlim(left=0, right=max(max_iter, 100))
+
+    ax.set_xlabel(f"Iterations ({scale_label} scale)")
     ax.set_ylabel("Best-so-far (max-group loss - OPT)")
     ax.set_title(title)
     ax.grid(True, which="both", linestyle="--", linewidth=0.5)
@@ -79,15 +96,12 @@ def plot_convergence(
     plt.show()
 
 
-def _scaled_times(iters, total_runtime):
-    """Map iteration indices to proportional wall-clock times."""
-    iters = np.asarray(iters, float)
-    T_max = max(float(iters[-1]), 1.0) if iters.size > 0 else 1.0
-    return (iters / T_max) * max(total_runtime, 1e-9)
-
-
 def timed_run(solver_fn, *args, **kwargs) -> tuple[SolverResult | None, float]:
-    """Run a solver and return (result, wall_clock_seconds)."""
+    """Run a solver and return (result, wall_clock_seconds).
+
+    Kept for backward compatibility; the solvers now record per-iteration
+    timestamps in result.times directly, so this wrapper is rarely needed.
+    """
     start = time.perf_counter()
     result = solver_fn(*args, **kwargs)
     elapsed = time.perf_counter() - start
@@ -95,19 +109,23 @@ def timed_run(solver_fn, *args, **kwargs) -> tuple[SolverResult | None, float]:
 
 
 def plot_time_vs_accuracy(
-    timed_curves: dict[str, tuple[SolverResult, float]],
+    curves: dict[str, SolverResult],
     F_opt: float | None = None,
     F_erm: float | None = None,
     title: str = "Time vs Accuracy",
     save_path: str | None = None,
+    log_scale: bool = True,
 ):
-    """Plot wall-clock time vs best-so-far accuracy (log scale x-axis).
+    """Plot wall-clock time vs best-so-far accuracy.
+
+    Uses the per-iteration `times` field recorded by each solver.
 
     Args:
-        timed_curves: {label: (SolverResult, total_runtime_seconds)}.
+        curves: {label: SolverResult} with result.times populated.
         F_opt: Optimal value to subtract.
         F_erm: ERM baseline.
         save_path: If provided, saves the figure.
+        log_scale: If True, use log scale on x-axis. If False, use linear.
     """
     baseline = F_opt if (F_opt is not None and np.isfinite(F_opt)) else 0.0
 
@@ -118,11 +136,11 @@ def plot_time_vs_accuracy(
         ax.axhline(y=gap, linestyle="--", linewidth=1.5, color="gray",
                     label=f"ERM - OPT ({gap:.2e})")
 
-    for label, (result, runtime) in timed_curves.items():
-        if result is None or result.iters is None or result.best_values is None:
+    for label, result in curves.items():
+        if result is None or result.times is None or result.best_values is None:
             continue
 
-        times = _scaled_times(result.iters, runtime)
+        times = np.asarray(result.times, float)
         vals = _monotone_best(result.best_values)
 
         mask = np.isfinite(times) & np.isfinite(vals)
@@ -131,14 +149,18 @@ def plot_time_vs_accuracy(
             continue
 
         gaps = np.maximum(vals - baseline, 1e-16)
-        times = np.maximum(times, 1e-7)
+        if log_scale:
+            times = np.maximum(times, 1e-7)
 
         marker = "o" if len(times) <= 40 else None
         ax.plot(times, gaps, label=label, linewidth=2.0,
                 marker=marker, markersize=4 if marker else 0)
 
-    ax.set_xscale("log")
-    ax.set_xlabel("Runtime (seconds, log scale)")
+    scale_label = "log" if log_scale else "linear"
+    if log_scale:
+        ax.set_xscale("log")
+
+    ax.set_xlabel(f"Runtime (seconds, {scale_label} scale)")
     ax.set_ylabel("Best-so-far (max-group loss - OPT)")
     ax.set_title(title)
     ax.grid(True, which="both", linestyle="--", linewidth=0.5)
