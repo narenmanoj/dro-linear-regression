@@ -12,7 +12,7 @@ $$\min_{x \in \mathbb{R}^d} \max_{i \in [m]} \frac{1}{n_i} \|A_i x - b_i\|^2$$
 pip install -r requirements.txt
 ```
 
-Requires: `numpy`, `matplotlib`, `cvxpy` (for exact solver), `pandas` (for CSV loading).
+Requires Python 3.10+ and: `numpy`, `matplotlib`, `cvxpy` (for the exact solver), `pandas` (for CSV loading), `folktables` (for the ACS income dataset).
 
 ## Quick start
 
