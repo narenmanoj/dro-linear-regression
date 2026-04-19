@@ -123,12 +123,58 @@ We compare a wide range of baselines: subgradient descent on the raw max-loss, s
 
 The meaning of an _iteration_ differs across methods. For the subgradient and smoothed-gradient methods, one iteration is a single full gradient or subgradient step on the smoothed or nonsmoothed objective. For the interior-point method, one iteration is a single outer Newton step of the barrier procedure. For the ball-oracle methods, one iteration is a single call to the Newton trust-region solver. To ensure fairness, our plots always compare methods by the number of their own natural outer iterations.
 
+## Real-world experiment: ACS Income (Folktables)
+
+We evaluate our algorithms on a real-world regression task from the American Community Survey (ACS), loaded via the [Folktables](https://github.com/socialfoundations/folktables) package.
+
+### Prediction problem
+
+The task is to predict **log personal income** from 10 demographic and employment features (age, education, occupation, hours worked, etc.) for employed US adults. The data is grouped by **US state**, making this a natural setting for group DRO: income distributions vary substantially across states, and a model that minimizes average prediction error may perform poorly on some states.
+
+We use 5 states (CA, TX, NY, FL, IL) with 200 samples per state, giving 1000 total samples in 10 dimensions. The features are standardized to zero mean and unit variance.
+
+```bash
+python run_experiment.py --folktables --acs-states CA TX NY FL IL --acs-subsample 200 --T 20
+```
+
+### Per-group loss comparison
+
+The table below shows the mean squared error per group (state) for each solver, along with aggregate statistics. All methods use the ERM solution as a warm start and are tuned via grid search over 20 iterations.
+
+| Group |   n |     ERM | OPT (CVXPY) | Subgradient | Smoothed HB |     IPM | Ball-Oracle (Euc.) | Ball-Oracle (Lewis) |
+|-------|-----|---------|-------------|-------------|-------------|---------|--------------------:|--------------------:|
+| CA    | 200 | 116.048 |     111.123 |     115.955 |     111.088 | 111.123 |            111.130  |            111.120  |
+| FL    | 200 | 107.737 |     110.533 |     107.765 |     110.152 | 110.533 |            110.447  |            110.538  |
+| IL    | 200 | 107.781 |     111.123 |     107.828 |     111.035 | 111.123 |            111.059  |            111.066  |
+| NY    | 200 | 112.438 |     111.123 |     112.430 |     111.226 | 111.123 |            111.147  |            111.150  |
+| TX    | 200 | 108.680 |     111.123 |     108.706 |     111.137 | 111.123 |            111.126  |            111.126  |
+| | | | | | | | | |
+| **Max**  |  | 116.048 | 111.123 | 115.955 | 111.226 | 111.123 | 111.147 | 111.150 |
+| **Mean** |  | 110.537 | 111.005 | 110.537 | 110.928 | 111.005 | 110.982 | 111.000 |
+| **Std**  |  |   3.252 |   0.236 |   3.204 |   0.393 |   0.236 |   0.269 |   0.233 |
+| **Max/Mean** | | 1.050 | 1.001 | 1.049 | 1.003 | 1.001 | 1.001 | 1.001 |
+
+### Observations
+
+- **ERM** achieves the lowest average loss (110.54) but has the highest worst-group loss (116.05 for CA). The max/mean ratio of 1.050 means the worst state's error is 5% higher than average.
+
+- **OPT (CVXPY)** equalizes all group losses to ~111.12, with a max/mean ratio of 1.001. It sacrifices ~0.5 on average loss to bring the worst group down by ~5. This is the optimal tradeoff — the price of fairness.
+
+- **IPM** and **both ball-oracle methods** closely match the exact optimum within 20 iterations, achieving max/mean ratios of ~1.001. The per-group losses are nearly equalized across states.
+
+- **Subgradient descent** barely moves from ERM within 20 iterations — the max/mean ratio remains at 1.049.
+
+- **Smoothed Heavy-Ball** makes significant progress but slightly overshoots on NY (111.23 > 111.12), leaving a small gap.
+
+The key takeaway: on real census data, the robust (DRO) solution successfully redistributes prediction accuracy from well-served states (FL, IL, TX) to the worst-served state (CA), at a modest cost to average performance.
+
 ## Adding new datasets
 
-The package supports three ways to provide data:
+The package supports four ways to provide data:
 
 1. **Synthetic**: Use `dro.generate_hard_instance(...)` with custom parameters.
 2. **From arrays**: Use `dro.from_arrays(A, b, groups)` where `A` is the design matrix, `b` is the response, and `groups` is an integer array of group labels.
 3. **From CSV**: Use `dro.from_csv(path, target_col, group_col)` or the `--csv` flag on `run_experiment.py`.
+4. **Folktables (ACS)**: Use `dro.load_acs_income(states=..., group_by="state")` or the `--folktables` flag. Requires `pip install folktables`. Supports grouping by US state or race.
 
 Any dataset that provides `(A_groups, b_groups)` — a list of per-group design matrices and response vectors — is compatible with all solvers and tuning routines.

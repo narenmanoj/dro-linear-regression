@@ -9,6 +9,9 @@ Usage:
     python run_experiment.py --csv data.csv \\
         --target y --group g                         # load from CSV
     python run_experiment.py --m 50 --d 5 --seed 42  # custom synthetic params
+    python run_experiment.py --folktables             # ACS income (10 US states)
+    python run_experiment.py --folktables \\
+        --acs-states CA TX NY --acs-subsample 200     # custom ACS options
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ def make_parser() -> argparse.ArgumentParser:
     grp = p.add_mutually_exclusive_group()
     grp.add_argument("--csv", type=str, default=None,
                       help="Path to CSV file with group regression data.")
+    grp.add_argument("--folktables", action="store_true", default=False,
+                      help="Use ACS income data from Folktables (grouped by state).")
     grp.add_argument("--synthetic", action="store_true", default=True,
                       help="Use synthetic adversarial instance (default).")
 
@@ -42,6 +47,16 @@ def make_parser() -> argparse.ArgumentParser:
                     help="Group column name (for --csv).")
     p.add_argument("--features", nargs="*", default=None,
                     help="Feature column names (for --csv). Default: all others.")
+
+    # Folktables options.
+    p.add_argument("--acs-states", nargs="*", default=None,
+                    help="State abbreviations for Folktables (default: 10 most populous).")
+    p.add_argument("--acs-group-by", choices=["state", "race"], default="state",
+                    help="Grouping for Folktables data.")
+    p.add_argument("--acs-subsample", type=int, default=None,
+                    help="Subsample per group for Folktables (for speed).")
+    p.add_argument("--acs-year", type=str, default="2018",
+                    help="ACS survey year.")
 
     # Synthetic instance parameters.
     p.add_argument("--m", type=int, default=100, help="Total groups.")
@@ -72,6 +87,15 @@ def main():
             args.csv, target_col=args.target, group_col=args.group,
             feature_cols=args.features,
         )
+    elif args.folktables:
+        print("Loading ACS income data from Folktables...")
+        A_groups, b_groups, acs_info = dro.load_acs_income(
+            states=args.acs_states,
+            survey_year=args.acs_year,
+            group_by=args.acs_group_by,
+            subsample=args.acs_subsample,
+        )
+        print(f"  Groups: {acs_info['group_names']}")
     else:
         print("Generating synthetic adversarial instance...")
         A_groups, b_groups = dro.generate_hard_instance(
@@ -209,9 +233,31 @@ def main():
                 curves["Ball-Oracle (Lewis)"] = res
 
     # ------------------------------------------------------------------
-    # 7. Plot iterations
+    # 7. Summary table
     # ------------------------------------------------------------------
-    print("\nPlotting iteration convergence...")
+    print("\n" + "=" * 60)
+    print("Per-group loss summary")
+    print("=" * 60 + "\n")
+
+    # Collect solutions for the summary.
+    solutions = {"ERM": x_erm}
+    if F_opt is not None:
+        solutions["OPT (CVXPY)"] = opt_result.x_final
+    for label, result in curves.items():
+        solutions[label] = result.x_final
+
+    # Group names (from Folktables info or generic).
+    group_names = None
+    if args.folktables:
+        group_names = acs_info["group_names"]
+
+    dro.summarize(A_groups, b_groups, solutions, group_names=group_names)
+    print()
+
+    # ------------------------------------------------------------------
+    # 8. Plot iterations
+    # ------------------------------------------------------------------
+    print("Plotting iteration convergence...")
     plotting.plot_convergence(
         curves, F_opt=F_opt, F_erm=F_erm,
         title="Convergence on Max-Loss (0-{} iterations)".format(args.T),
