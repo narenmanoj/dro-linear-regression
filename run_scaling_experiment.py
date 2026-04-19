@@ -165,90 +165,52 @@ def run_one_size(
     xnorm_euc = max(float(np.linalg.norm(x0)), 1.0)
 
     results = {}
-
+    trajectories = {}  # full SolverResult objects, for per-m plots
     tb = args.max_solver_time
 
-    # Subgradient (diminishing).
-    t0 = time.perf_counter()
-    res = solvers.subgradient_diminishing(
-        A_groups, b_groups, x0,
-        base_step=1e-5, T=args.T_cap, time_budget=tb,
-    )
-    if res:
-        results["Subgradient"] = {
+    def _record(label, res):
+        if res is None:
+            return
+        results[label] = {
             "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
             "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
             "final_loss": res.best_loss,
-            "total_time": time.perf_counter() - t0,
         }
+        trajectories[label] = res
 
-    # Smoothed Heavy-Ball.
-    t0 = time.perf_counter()
-    res = solvers.smooth_heavy_ball(
+    _record("Subgradient", solvers.subgradient_diminishing(
+        A_groups, b_groups, x0,
+        base_step=1e-5, T=args.T_cap, time_budget=tb,
+    ))
+    _record("Smoothed Heavy-Ball", solvers.smooth_heavy_ball(
         A_groups, b_groups, x0,
         beta=beta, delta=delta, step=1e-3, momentum=0.9,
         T=args.T_cap, time_budget=tb,
-    )
-    if res:
-        results["Smoothed Heavy-Ball"] = {
-            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
-            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
-            "final_loss": res.best_loss,
-            "total_time": time.perf_counter() - t0,
-        }
-
-    # IPM.
-    t0 = time.perf_counter()
-    res = solvers.interior_point(
+    ))
+    _record("IPM", solvers.interior_point(
         A_groups, b_groups, x0,
         mu0=1e-3, tau=0.5, inner_iters=3,
         max_newton_steps=args.T_cap, time_budget=tb,
-    )
-    if res:
-        results["IPM"] = {
-            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
-            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
-            "final_loss": res.best_loss,
-            "total_time": time.perf_counter() - t0,
-        }
-
-    # Ball-Oracle (Euclidean).
-    t0 = time.perf_counter()
-    res = solvers.ball_oracle_naive(
+    ))
+    _record("Ball-Oracle (Euclidean)", solvers.ball_oracle_naive(
         A_groups, b_groups, x0,
         beta=beta, delta=delta,
         R0=xnorm_euc, n_outer=args.T_cap, R_decay=0.9,
         max_newton_steps=args.newton_steps, time_budget=tb,
-    )
-    if res:
-        results["Ball-Oracle (Euclidean)"] = {
-            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
-            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
-            "final_loss": res.best_loss,
-            "total_time": time.perf_counter() - t0,
-        }
-
-    # Ball-Oracle (Lewis).
-    t0 = time.perf_counter()
-    res = solvers.ball_oracle_lewis(
+    ))
+    _record("Ball-Oracle (Lewis)", solvers.ball_oracle_lewis(
         A_groups, b_groups, x0, L=L,
         beta=beta, delta=delta,
         R0=xnorm_lewis, n_outer=args.T_cap, R_decay=0.9,
         max_newton_steps=args.newton_steps, time_budget=tb,
-    )
-    if res:
-        results["Ball-Oracle (Lewis)"] = {
-            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
-            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
-            "final_loss": res.best_loss,
-            "total_time": time.perf_counter() - t0,
-        }
+    ))
 
     return {
         "m": m,
         "F_erm": float(F_erm),
         "F_opt": float(F_opt),
         "solvers": results,
+        "trajectories": trajectories,
     }
 
 
@@ -350,6 +312,8 @@ def main():
             "F_erm": float(np.median([t["F_erm"] for t in trials])),
             "F_opt": float(np.median([t["F_opt"] for t in trials if t["F_opt"] is not None])),
             "solvers": solvers_agg,
+            # Keep trial 0's trajectories for the per-m plots (not serialized to JSON).
+            "trajectories": trials[0].get("trajectories", {}),
         }
 
         print(f"  [total {time.perf_counter() - t0:.1f}s, "
@@ -402,10 +366,53 @@ def main():
     # Config dump.
     dro.artifacts.save_config(run_dir, {"cli_args": vars(args), "m_values_used": m_values})
 
-    # JSON dump of raw results.
+    # JSON dump of raw results (strip trajectories — they're SolverResult objects,
+    # saved as PNG plots instead).
     import json
+    jsonable = [{k: v for k, v in r.items() if k != "trajectories"}
+                for r in sweep_results]
     with open(os.path.join(run_dir, "scaling_results.json"), "w") as f:
-        json.dump(dro.artifacts._to_jsonable(sweep_results), f, indent=2)
+        json.dump(dro.artifacts._to_jsonable(jsonable), f, indent=2)
+
+    # --------------------------------------------------------------------
+    # Per-m convergence plots: 4 plots per m (iters log/linear, time log/linear).
+    # --------------------------------------------------------------------
+    per_m_dir = os.path.join(run_dir, "per_m_plots")
+    os.makedirs(per_m_dir, exist_ok=True)
+
+    for result in sweep_results:
+        m = result["m"]
+        curves = result.get("trajectories", {})
+        if not curves:
+            continue
+
+        F_opt = result["F_opt"]
+        F_erm = result["F_erm"]
+
+        dro.plotting.plot_convergence(
+            curves, F_opt=F_opt, F_erm=F_erm,
+            title=f"m={m}: Convergence vs iterations (log scale)",
+            save_path=os.path.join(per_m_dir, f"iterations_m{m}.png"),
+            log_scale=True,
+        )
+        dro.plotting.plot_convergence(
+            curves, F_opt=F_opt, F_erm=F_erm,
+            title=f"m={m}: Convergence vs iterations (linear scale)",
+            save_path=os.path.join(per_m_dir, f"iterations_m{m}_linear.png"),
+            log_scale=False,
+        )
+        dro.plotting.plot_time_vs_accuracy(
+            curves, F_opt=F_opt, F_erm=F_erm,
+            title=f"m={m}: Convergence vs wall-clock time (log scale)",
+            save_path=os.path.join(per_m_dir, f"time_m{m}.png"),
+            log_scale=True,
+        )
+        dro.plotting.plot_time_vs_accuracy(
+            curves, F_opt=F_opt, F_erm=F_erm,
+            title=f"m={m}: Convergence vs wall-clock time (linear scale)",
+            save_path=os.path.join(per_m_dir, f"time_m{m}_linear.png"),
+            log_scale=False,
+        )
 
     # Plots: m vs iterations, m vs time, with reference slopes.
     # Both log-log and linear-scale versions.
@@ -443,8 +450,8 @@ def main():
     )
 
     print(f"\nDone. Artifacts saved to: {run_dir}")
-    print("  Plots: scaling_iters.png, scaling_iters_linear.png,")
-    print("         scaling_time.png,  scaling_time_linear.png")
+    print("  Scaling plots: scaling_iters{,_linear}.png, scaling_time{,_linear}.png")
+    print(f"  Per-m plots:   per_m_plots/ (iterations_m*.png, time_m*.png; log + linear)")
 
 
 if __name__ == "__main__":
