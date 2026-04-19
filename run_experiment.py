@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import numpy as np
@@ -68,10 +69,12 @@ def make_parser() -> argparse.ArgumentParser:
     # Experiment parameters.
     p.add_argument("--T", type=int, default=100, help="Iteration budget.")
     p.add_argument("--warm-start", choices=["erm", "zero", "rand"], default="erm")
-    p.add_argument("--save-iterations", type=str, default="iterations.png")
-    p.add_argument("--save-iterations-linear", type=str, default="iterations_linear.png")
-    p.add_argument("--save-time", type=str, default="time.png")
-    p.add_argument("--save-time-linear", type=str, default="time_linear.png")
+
+    # Run artifact parameters.
+    p.add_argument("--runs-root", type=str, default="runs",
+                    help="Parent directory for run folders.")
+    p.add_argument("--run-name", type=str, default=None,
+                    help="Optional suffix for the run directory name.")
     p.add_argument("--verbose", action="store_true")
 
     return p
@@ -79,6 +82,12 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main():
     args = make_parser().parse_args()
+
+    # ------------------------------------------------------------------
+    # 0. Create run directory
+    # ------------------------------------------------------------------
+    run_dir = dro.artifacts.create_run_dir(root=args.runs_root, name=args.run_name)
+    print(f"Run directory: {run_dir}")
 
     # ------------------------------------------------------------------
     # 1. Load or generate data
@@ -171,6 +180,9 @@ def main():
         else:
             print(f"  {name}: no stable configuration found")
 
+    # Persist tuned hyperparameters to the run directory.
+    dro.artifacts.save_hyperparameters(run_dir, configs)
+
     # ------------------------------------------------------------------
     # 6. Final runs for convergence curves
     # ------------------------------------------------------------------
@@ -240,7 +252,7 @@ def main():
                 curves["Ball-Oracle (Lewis)"] = res
 
     # ------------------------------------------------------------------
-    # 7. Summary table
+    # 7. Summary table and artifact persistence
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("Per-group loss summary")
@@ -258,23 +270,59 @@ def main():
     if args.folktables:
         group_names = acs_info["group_names"]
 
-    dro.summarize(A_groups, b_groups, solutions, group_names=group_names)
+    summary_text = dro.summarize(A_groups, b_groups, solutions, group_names=group_names)
     print()
+
+    # Persist summary, losses CSV, solutions, curves, and config.
+    dro.artifacts.save_summary_txt(run_dir, summary_text)
+    stats = dro.artifacts.save_losses(run_dir, A_groups, b_groups, solutions,
+                                        group_names=group_names)
+    dro.artifacts.save_stats(run_dir, stats)
+    dro.artifacts.save_solutions(run_dir, solutions)
+    dro.artifacts.save_curves(run_dir, curves)
+
+    # Config dump captures everything needed to reproduce the run.
+    config_dump = {
+        "cli_args": vars(args),
+        "dataset": {
+            "m": m,
+            "d": d,
+            "cond_stack": cond_stack,
+            "group_names": group_names,
+        },
+        "baselines": {
+            "F_erm": F_erm,
+            "F_opt": F_opt,
+            "warm_start": args.warm_start,
+        },
+    }
+    if args.folktables:
+        config_dump["dataset"]["folktables"] = {
+            "group_names": acs_info["group_names"],
+            "feature_names": acs_info["feature_names"],
+            "n_total": acs_info["n_total"],
+        }
+    dro.artifacts.save_config(run_dir, config_dump)
 
     # ------------------------------------------------------------------
     # 8. Plot iterations (log + linear)
     # ------------------------------------------------------------------
+    save_iterations = os.path.join(run_dir, "iterations.png")
+    save_iterations_linear = os.path.join(run_dir, "iterations_linear.png")
+    save_time = os.path.join(run_dir, "time.png")
+    save_time_linear = os.path.join(run_dir, "time_linear.png")
+
     print("Plotting iteration convergence...")
     plotting.plot_convergence(
         curves, F_opt=F_opt, F_erm=F_erm,
         title="Convergence on Max-Loss (0-{} iterations, log scale)".format(args.T),
-        save_path=args.save_iterations,
+        save_path=save_iterations,
         log_scale=True,
     )
     plotting.plot_convergence(
         curves, F_opt=F_opt, F_erm=F_erm,
         title="Convergence on Max-Loss (0-{} iterations, linear scale)".format(args.T),
-        save_path=args.save_iterations_linear,
+        save_path=save_iterations_linear,
         log_scale=False,
     )
 
@@ -370,19 +418,27 @@ def main():
     plotting.plot_time_vs_accuracy(
         timed_curves, F_opt=F_opt, F_erm=F_erm,
         title=f"Time vs Accuracy (equal {time_budget*1000:.1f} ms budget, log scale)",
-        save_path=args.save_time,
+        save_path=save_time,
         log_scale=True,
     )
     plotting.plot_time_vs_accuracy(
         timed_curves, F_opt=F_opt, F_erm=F_erm,
         title=f"Time vs Accuracy (equal {time_budget*1000:.1f} ms budget, linear scale)",
-        save_path=args.save_time_linear,
+        save_path=save_time_linear,
         log_scale=False,
     )
 
-    print("\nDone. Plots saved to:")
-    print(f"  {args.save_iterations}, {args.save_iterations_linear}")
-    print(f"  {args.save_time}, {args.save_time_linear}")
+    # Save equal-runtime curves too (distinguished by "timed:" prefix).
+    timed_curves_prefixed = {f"timed_{label}": res for label, res in timed_curves.items()}
+    merged_curves = {**curves, **timed_curves_prefixed}
+    dro.artifacts.save_curves(run_dir, merged_curves)
+
+    print(f"\nDone. All artifacts saved to: {run_dir}")
+    print("  - config.json, hyperparameters.json, stats.json")
+    print("  - losses.csv, summary.txt")
+    print("  - solutions.npz, curves.npz")
+    print("  - iterations.png, iterations_linear.png")
+    print("  - time.png, time_linear.png")
 
 
 if __name__ == "__main__":

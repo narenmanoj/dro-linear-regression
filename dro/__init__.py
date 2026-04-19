@@ -12,6 +12,7 @@ from .gp_objective import gp_value, gp_power_value
 from . import solvers
 from . import tuning
 from . import plotting
+from . import artifacts
 
 __all__ = [
     "SolverResult",
@@ -32,4 +33,5 @@ __all__ = [
     "solvers",
     "tuning",
     "plotting",
+    "artifacts",
 ]
