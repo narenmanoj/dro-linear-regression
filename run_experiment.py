@@ -52,8 +52,8 @@ def make_parser() -> argparse.ArgumentParser:
                     help="State abbreviations for Folktables (default: 10 most populous).")
     p.add_argument("--acs-all", action="store_true",
                     help="Use all 50 states + DC + PR for Folktables (overrides --acs-states).")
-    p.add_argument("--acs-group-by", choices=["state", "race"], default="state",
-                    help="Grouping for Folktables data.")
+    p.add_argument("--acs-group-by", choices=["state", "race", "puma", "state_race"],
+                    default="state", help="Grouping for Folktables data.")
     p.add_argument("--acs-subsample", type=int, default=None,
                     help="Subsample per group for Folktables (for speed).")
     p.add_argument("--acs-year", type=str, default="2018",

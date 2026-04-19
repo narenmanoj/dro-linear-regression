@@ -79,9 +79,12 @@ def load_acs_income(
             Defaults to the 10 most populous states.
         survey_year: ACS survey year (e.g., "2018", "2019").
         group_by: How to define groups. Options:
-            "state" — group by US state (FIPS code). Natural for DRO since
-                      income distributions vary substantially across states.
-            "race"  — group by race (RAC1P). Common fairness benchmark.
+            "state" — group by US state (FIPS code). ~51 groups.
+            "race"  — group by race (RAC1P). ~9 groups (small).
+            "puma"  — group by Public Use Microdata Area. Combines state FIPS
+                      and PUMA code for unique geographic groups. ~2,400 nationally,
+                      ~265 in CA alone. Good for studying m-dependence.
+            "state_race" — (state, race) cross. ~459 groups nationally.
         log_income: If True, predict log(1 + income) instead of raw income.
             Log-transform reduces skew and makes regression better-conditioned.
         standardize: If True, standardize features to zero mean, unit variance.
@@ -130,18 +133,39 @@ def load_acs_income(
     else:
         y = df["PINCP"].values.astype(np.float64)
 
-    # Group labels.
+    # Group labels. For numeric grouping we build an int code per row and
+    # a code-to-name mapping for readable labels.
+    _RACE_NAMES = {
+        1: "White", 2: "Black", 3: "AIAN", 4: "Alaska Native",
+        5: "AIAN+", 6: "Asian", 7: "NHPI", 8: "Other", 9: "Two+",
+    }
+
     if group_by == "state":
         group_codes = df["ST"].values.astype(int)
         code_to_name = _FIPS_TO_STATE
     elif group_by == "race":
         group_codes = df["RAC1P"].values.astype(int)
+        code_to_name = _RACE_NAMES
+    elif group_by == "puma":
+        # PUMA codes are only unique within a state; combine with FIPS for global uniqueness.
+        # Encode as state_fips * 10000 + puma (PUMAs are 5-digit ints).
+        st = df["ST"].values.astype(int)
+        puma = df["PUMA"].values.astype(int)
+        group_codes = st * 100000 + puma
         code_to_name = {
-            1: "White", 2: "Black", 3: "AIAN", 4: "Alaska Native",
-            5: "AIAN+", 6: "Asian", 7: "NHPI", 8: "Other", 9: "Two+",
+            c: f"{_FIPS_TO_STATE.get(c // 100000, str(c // 100000))}_{c % 100000:05d}"
+            for c in np.unique(group_codes)
+        }
+    elif group_by == "state_race":
+        st = df["ST"].values.astype(int)
+        race = df["RAC1P"].values.astype(int)
+        group_codes = st * 100 + race  # race is 1-9, so st*100+race is unique
+        code_to_name = {
+            c: f"{_FIPS_TO_STATE.get(c // 100, str(c // 100))}_{_RACE_NAMES.get(c % 100, str(c % 100))}"
+            for c in np.unique(group_codes)
         }
     else:
-        raise ValueError(f"Unknown group_by={group_by!r}. Use 'state' or 'race'.")
+        raise ValueError(f"Unknown group_by={group_by!r}. Use 'state', 'race', 'puma', or 'state_race'.")
 
     # Standardize features.
     if standardize:

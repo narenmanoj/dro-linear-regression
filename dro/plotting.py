@@ -172,6 +172,71 @@ def plot_time_vs_accuracy(
     plt.show()
 
 
+def plot_scaling(
+    scaling_data: dict[str, dict[int, float]],
+    ylabel: str = "Iterations to target accuracy",
+    title: str = "Scaling with number of groups m",
+    save_path: str | None = None,
+    log_scale: bool = True,
+    reference_slopes: dict[str, float] | None = None,
+):
+    """Plot some metric vs number of groups m, one curve per solver.
+
+    Args:
+        scaling_data: {solver_label: {m: metric_value}}.
+        ylabel: Y-axis label (typically "iterations" or "runtime (s)").
+        title: Plot title.
+        save_path: If provided, save the figure.
+        log_scale: If True, use log-log axes.
+        reference_slopes: Optional {label: exponent} to overlay reference lines
+            m^exponent. For example, {"m^(1/3)": 1/3, "m^(1/2)": 1/2}.
+    """
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    all_m = set()
+    for m_to_val in scaling_data.values():
+        all_m.update(m_to_val.keys())
+    all_m = sorted(all_m)
+
+    for label, m_to_val in scaling_data.items():
+        ms = sorted(m_to_val.keys())
+        vals = [m_to_val[m] for m in ms]
+        mask = np.isfinite(vals)
+        ms_arr = np.array(ms)[mask]
+        vals_arr = np.array(vals)[mask]
+        if len(ms_arr) == 0:
+            continue
+        ax.plot(ms_arr, vals_arr, "o-", label=label, linewidth=2.0, markersize=6)
+
+    # Reference slopes anchored at the first m.
+    if reference_slopes and all_m:
+        m0 = all_m[0]
+        # Anchor y to the median value across solvers at m0 (if available).
+        y_anchors = [m_to_val[m0] for m_to_val in scaling_data.values()
+                      if m0 in m_to_val and np.isfinite(m_to_val[m0])]
+        if y_anchors:
+            y0 = float(np.median(y_anchors))
+            ms_ref = np.array(all_m)
+            for slope_label, slope in reference_slopes.items():
+                y_ref = y0 * (ms_ref / m0) ** slope
+                ax.plot(ms_ref, y_ref, "--", alpha=0.5, linewidth=1.0,
+                        label=f"∝ {slope_label}")
+
+    if log_scale:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    ax.set_xlabel("Number of groups m" + (" (log)" if log_scale else ""))
+    ax.set_ylabel(ylabel + (" (log)" if log_scale else ""))
+    ax.set_title(title)
+    ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+    ax.legend()
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+
+
 def plot_interpolation_path(
     path: list[dict],
     F_opt: float | None = None,
