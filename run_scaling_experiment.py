@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Scaling experiment: iterations-to-accuracy vs number of groups m.
+
+Loads PUMA-grouped ACS income data (thousands of geographic groups), then
+sweeps over m by subsampling groups. For each m, runs all solvers and records
+the number of iterations (and wall-clock time) required to reach a target
+accuracy (relative gap to the robust optimum).
+
+This isolates the m-dependence of each solver's iteration complexity:
+  - Subgradient, smoothed GD : m-independent (but geometry-dependent)
+  - IPM                      : ~ m^{1/2} log(1/eps)
+  - Ball-Oracle (naive)      : ~ m^{1/3} / eps^{2/3}
+  - Ball-Oracle (Lewis)      : ~ min(rank(A), m)^{1/3} / eps^{2/3}
+
+The Lewis-geometry method is expected to *plateau* once m > rank(A) = d,
+while IPM and the naive Euclidean version should grow with m.
+
+Usage:
+    python run_scaling_experiment.py                              # default: CA PUMAs
+    python run_scaling_experiment.py --acs-states CA TX NY FL IL  # larger pool
+    python run_scaling_experiment.py --m-values 50 100 200 500    # custom sweep
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import time
+
+import numpy as np
+
+import dro
+from dro import solvers
+from dro.lewis_weights import build_lewis_geometry
+
+
+def make_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Scaling experiment: m vs iterations-to-accuracy.")
+
+    # Data.
+    p.add_argument("--acs-states", nargs="*", default=["CA"],
+                    help="States to load PUMAs from (default: CA, gives ~265 PUMAs).")
+    p.add_argument("--acs-all", action="store_true",
+                    help="Use all 51 regions (~2400 PUMAs nationally).")
+    p.add_argument("--acs-year", type=str, default="2018")
+    p.add_argument("--samples-per-puma", type=int, default=50,
+                    help="Fixed samples per PUMA (subsample within each group).")
+
+    # Sweep.
+    p.add_argument("--m-values", nargs="*", type=int,
+                    default=[25, 50, 100, 200],
+                    help="Values of m (number of groups) to sweep over.")
+    p.add_argument("--target-rel-gap", type=float, default=0.02,
+                    help="Stop criterion: (max_loss - OPT) / OPT <= target.")
+    p.add_argument("--T-cap", type=int, default=200,
+                    help="Max iterations per solver (cap on iteration budget).")
+    p.add_argument("--n-trials", type=int, default=3,
+                    help="Number of random subsets per m (results averaged).")
+    p.add_argument("--seed", type=int, default=0)
+
+    # Artifacts.
+    p.add_argument("--runs-root", type=str, default="runs")
+    p.add_argument("--run-name", type=str, default="scaling")
+
+    # Solver hyperparameters (fixed across m to keep the sweep clean).
+    p.add_argument("--beta-rel", type=float, default=0.01,
+                    help="Smoothing beta as fraction of initial max-loss.")
+    p.add_argument("--delta-rel", type=float, default=0.0,
+                    help="Smoothing delta as fraction of initial max-loss.")
+    p.add_argument("--newton-steps", type=int, default=5,
+                    help="Inner Newton steps per ball-oracle call.")
+
+    return p
+
+
+def iters_to_accuracy(
+    iters: list[int],
+    best_values: list[float],
+    F_opt: float,
+    target_rel_gap: float,
+) -> int | None:
+    """Return first iteration index where (best - OPT) / OPT <= target, or None."""
+    if not iters or not best_values or not np.isfinite(F_opt) or F_opt <= 0:
+        return None
+    for k, v in zip(iters, best_values):
+        if (v - F_opt) / F_opt <= target_rel_gap:
+            return k
+    return None
+
+
+def time_to_accuracy(
+    times: list[float],
+    best_values: list[float],
+    F_opt: float,
+    target_rel_gap: float,
+) -> float | None:
+    """Return first wall-clock second where target accuracy is reached, or None."""
+    if not times or not best_values or not np.isfinite(F_opt) or F_opt <= 0:
+        return None
+    for t, v in zip(times, best_values):
+        if (v - F_opt) / F_opt <= target_rel_gap:
+            return float(t)
+    return None
+
+
+def run_one_size(
+    A_groups_full,
+    b_groups_full,
+    m: int,
+    args,
+    rng,
+) -> dict:
+    """Run all solvers on a random subset of m groups. Returns per-solver stats."""
+    # Subsample groups (without replacement).
+    idx = rng.choice(len(A_groups_full), size=m, replace=False)
+    A_groups = [A_groups_full[i] for i in idx]
+    b_groups = [b_groups_full[i] for i in idx]
+
+    d = A_groups[0].shape[1]
+
+    # Baselines.
+    x0 = dro.erm_solution(A_groups, b_groups)
+    F_erm = dro.max_group_loss(A_groups, b_groups, x0)
+
+    try:
+        opt = solvers.solve_exact(A_groups, b_groups)
+        F_opt = opt.best_loss
+    except Exception as e:
+        print(f"    [CVXPY failed at m={m}: {e}]")
+        return {"m": m, "F_erm": F_erm, "F_opt": None, "solvers": {}}
+
+    # Smoothing parameters: follow Algorithm 1 line 5 of the paper, scaled so
+    # the smoothed objective is accurate to within the target additive error.
+    # Choice: beta = eps / (4 log m), delta = eps / 4, where eps = target_rel_gap * F_opt.
+    eps_additive = args.target_rel_gap * F_opt
+    beta = eps_additive / (4.0 * max(np.log(m), 1.0))
+    delta = eps_additive / 4.0
+
+    # Lewis geometry.
+    L = build_lewis_geometry(A_groups, b_groups, p=np.inf)
+    xnorm_lewis = max(float(np.linalg.norm(L @ x0)), 1.0)
+    xnorm_euc = max(float(np.linalg.norm(x0)), 1.0)
+
+    results = {}
+
+    # Subgradient (diminishing).
+    t0 = time.perf_counter()
+    res = solvers.subgradient_diminishing(
+        A_groups, b_groups, x0,
+        base_step=1e-5, T=args.T_cap,
+    )
+    if res:
+        results["Subgradient"] = {
+            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
+            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
+            "final_loss": res.best_loss,
+            "total_time": time.perf_counter() - t0,
+        }
+
+    # Smoothed Heavy-Ball.
+    t0 = time.perf_counter()
+    res = solvers.smooth_heavy_ball(
+        A_groups, b_groups, x0,
+        beta=beta, delta=delta, step=1e-3, momentum=0.9, T=args.T_cap,
+    )
+    if res:
+        results["Smoothed Heavy-Ball"] = {
+            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
+            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
+            "final_loss": res.best_loss,
+            "total_time": time.perf_counter() - t0,
+        }
+
+    # IPM.
+    t0 = time.perf_counter()
+    res = solvers.interior_point(
+        A_groups, b_groups, x0,
+        mu0=1e-3, tau=0.5, inner_iters=3, max_newton_steps=args.T_cap,
+    )
+    if res:
+        results["IPM"] = {
+            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
+            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
+            "final_loss": res.best_loss,
+            "total_time": time.perf_counter() - t0,
+        }
+
+    # Ball-Oracle (Euclidean).
+    t0 = time.perf_counter()
+    res = solvers.ball_oracle_naive(
+        A_groups, b_groups, x0,
+        beta=beta, delta=delta,
+        R0=xnorm_euc, n_outer=args.T_cap, R_decay=0.9,
+        max_newton_steps=args.newton_steps,
+    )
+    if res:
+        results["Ball-Oracle (Euclidean)"] = {
+            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
+            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
+            "final_loss": res.best_loss,
+            "total_time": time.perf_counter() - t0,
+        }
+
+    # Ball-Oracle (Lewis).
+    t0 = time.perf_counter()
+    res = solvers.ball_oracle_lewis(
+        A_groups, b_groups, x0, L=L,
+        beta=beta, delta=delta,
+        R0=xnorm_lewis, n_outer=args.T_cap, R_decay=0.9,
+        max_newton_steps=args.newton_steps,
+    )
+    if res:
+        results["Ball-Oracle (Lewis)"] = {
+            "iters_to_target": iters_to_accuracy(res.iters, res.best_values, F_opt, args.target_rel_gap),
+            "time_to_target": time_to_accuracy(res.times, res.best_values, F_opt, args.target_rel_gap),
+            "final_loss": res.best_loss,
+            "total_time": time.perf_counter() - t0,
+        }
+
+    return {
+        "m": m,
+        "F_erm": float(F_erm),
+        "F_opt": float(F_opt),
+        "solvers": results,
+    }
+
+
+def main():
+    args = make_parser().parse_args()
+
+    # Create run directory.
+    run_dir = dro.artifacts.create_run_dir(root=args.runs_root, name=args.run_name)
+    print(f"Run directory: {run_dir}")
+
+    # Load the full PUMA-grouped dataset once.
+    if args.acs_all:
+        from dro.datasets_folktables import ALL_STATES
+        states = ALL_STATES
+    else:
+        states = args.acs_states
+
+    print(f"Loading ACS data for states: {states} ...")
+    A_groups_full, b_groups_full, info = dro.load_acs_income(
+        states=states,
+        survey_year=args.acs_year,
+        group_by="puma",
+        subsample=args.samples_per_puma,
+        min_group_size=args.samples_per_puma,  # keep only PUMAs with >= N samples
+    )
+    print(f"  Loaded {info['n_groups']} PUMAs, d={info['d']}, "
+          f"n_total={info['n_total']}")
+
+    # Filter requested m values to those <= available groups.
+    m_values = sorted(m for m in args.m_values if m <= info["n_groups"])
+    if not m_values:
+        raise ValueError(f"No m values in {args.m_values} are <= n_groups={info['n_groups']}.")
+    if max(args.m_values) > info["n_groups"]:
+        print(f"  Capping m at {info['n_groups']} (requested up to {max(args.m_values)}).")
+
+    print(f"\nSweeping m over {m_values} with target rel gap = {args.target_rel_gap:.3f}, "
+          f"n_trials = {args.n_trials}")
+
+    rng = np.random.default_rng(args.seed)
+    sweep_results = []
+
+    for m in m_values:
+        print(f"\n--- m = {m} ---")
+        t0 = time.perf_counter()
+
+        # Run n_trials independent trials with different random subsets.
+        trials = []
+        for trial in range(args.n_trials):
+            trial_result = run_one_size(A_groups_full, b_groups_full, m, args, rng)
+            trials.append(trial_result)
+
+        # Average metrics across trials (median is more robust than mean to failures).
+        def _agg(solver, field):
+            vals = [t["solvers"].get(solver, {}).get(field) for t in trials]
+            vals = [v for v in vals if v is not None]
+            return float(np.median(vals)) if vals else None
+
+        solvers_agg = {}
+        all_solver_names = set()
+        for t in trials:
+            all_solver_names.update(t["solvers"].keys())
+
+        for solver in all_solver_names:
+            iters_vals = [t["solvers"].get(solver, {}).get("iters_to_target") for t in trials]
+            time_vals = [t["solvers"].get(solver, {}).get("time_to_target") for t in trials]
+            iters_ok = [v for v in iters_vals if v is not None]
+            time_ok = [v for v in time_vals if v is not None]
+            solvers_agg[solver] = {
+                "iters_to_target": float(np.median(iters_ok)) if iters_ok else None,
+                "time_to_target": float(np.median(time_ok)) if time_ok else None,
+                "n_trials_succeeded": len(iters_ok),
+                "n_trials": args.n_trials,
+            }
+
+        result = {
+            "m": m,
+            "F_erm": float(np.median([t["F_erm"] for t in trials])),
+            "F_opt": float(np.median([t["F_opt"] for t in trials if t["F_opt"] is not None])),
+            "solvers": solvers_agg,
+        }
+
+        print(f"  [total {time.perf_counter() - t0:.1f}s, "
+              f"F_erm={result['F_erm']:.4f}, F_opt={result['F_opt']:.4f}]")
+        for solver_name, stats in result["solvers"].items():
+            its = stats["iters_to_target"]
+            tms = stats["time_to_target"]
+            its_str = f"{its:.1f}" if its is not None else "N/A"
+            tms_str = f"{tms*1000:.1f}ms" if tms is not None else "N/A"
+            n_ok = stats["n_trials_succeeded"]
+            print(f"  {solver_name:30s}: iters={its_str:>6}, time={tms_str:>10}  ({n_ok}/{stats['n_trials']} trials ok)")
+
+        sweep_results.append(result)
+
+    # --------------------------------------------------------------------
+    # Persist artifacts.
+    # --------------------------------------------------------------------
+
+    # Reshape into {solver: {m: metric}} for plotting.
+    iter_data = {}
+    time_data = {}
+    for result in sweep_results:
+        m = result["m"]
+        for solver, stats in result["solvers"].items():
+            iter_data.setdefault(solver, {})[m] = (
+                stats["iters_to_target"] if stats["iters_to_target"] is not None else np.inf
+            )
+            time_data.setdefault(solver, {})[m] = (
+                stats["time_to_target"] if stats["time_to_target"] is not None else np.inf
+            )
+
+    # CSV: one row per (m, solver) pair (median across trials).
+    import csv
+    with open(os.path.join(run_dir, "scaling.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["m", "solver", "iters_to_target_median", "time_to_target_s_median",
+                          "n_trials_succeeded", "n_trials", "F_erm_median", "F_opt_median"])
+        for result in sweep_results:
+            for solver, stats in result["solvers"].items():
+                writer.writerow([
+                    result["m"], solver,
+                    stats["iters_to_target"] if stats["iters_to_target"] is not None else "",
+                    stats["time_to_target"] if stats["time_to_target"] is not None else "",
+                    stats["n_trials_succeeded"],
+                    stats["n_trials"],
+                    f"{result['F_erm']:.6f}",
+                    f"{result['F_opt']:.6f}" if result['F_opt'] else "",
+                ])
+
+    # Config dump.
+    dro.artifacts.save_config(run_dir, {"cli_args": vars(args), "m_values_used": m_values})
+
+    # JSON dump of raw results.
+    import json
+    with open(os.path.join(run_dir, "scaling_results.json"), "w") as f:
+        json.dump(dro.artifacts._to_jsonable(sweep_results), f, indent=2)
+
+    # Plots: m vs iterations, m vs time, with reference slopes.
+    reference = {"m^(1/3)": 1.0 / 3.0, "m^(1/2)": 1.0 / 2.0}
+    dro.plotting.plot_scaling(
+        iter_data,
+        ylabel="Iterations to reach target gap",
+        title=f"Scaling: iterations to relative gap ≤ {args.target_rel_gap}",
+        save_path=os.path.join(run_dir, "scaling_iters.png"),
+        log_scale=True,
+        reference_slopes=reference,
+    )
+    dro.plotting.plot_scaling(
+        time_data,
+        ylabel="Wall-clock time to target gap (s)",
+        title=f"Scaling: time to relative gap ≤ {args.target_rel_gap}",
+        save_path=os.path.join(run_dir, "scaling_time.png"),
+        log_scale=True,
+        reference_slopes=reference,
+    )
+
+    print(f"\nDone. Artifacts saved to: {run_dir}")
+
+
+if __name__ == "__main__":
+    main()
