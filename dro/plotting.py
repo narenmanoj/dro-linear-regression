@@ -290,25 +290,34 @@ def _load_us_states_gdf(apply_insets: bool = True):
     gdf["abbr"] = gdf["name"].map(_STATE_NAME_TO_ABBR)
 
     if apply_insets:
-        # Target: AK as a scaled inset at the lower-left of the continental US,
-        # HI just below SoCal. Offsets below are in geographic degrees.
+        # Insets: AK is scaled down and placed at the lower-left of the continental
+        # US; HI is placed just to the right of AK. We use bbox-aware placement so
+        # that each inset lands at a known target center regardless of the source
+        # GeoJSON's raw bounds (e.g. whether it clips or wraps the Aleutians).
+        def _place_at(g, target_cx, target_cy):
+            bx_min, by_min, bx_max, by_max = g.bounds
+            cx = (bx_min + bx_max) / 2.0
+            cy = (by_min + by_max) / 2.0
+            return translate(g, xoff=target_cx - cx, yoff=target_cy - cy)
+
         new_geoms = []
         for _, row in gdf.iterrows():
             g = row.geometry
             if row["abbr"] == "AK":
                 g = shp_scale(g, xfact=0.35, yfact=0.35, origin="center")
-                g = translate(g, xoff=32, yoff=-43)
+                g = _place_at(g, target_cx=-118.0, target_cy=26.0)
             elif row["abbr"] == "HI":
-                g = translate(g, xoff=51, yoff=3)
+                g = _place_at(g, target_cx=-106.0, target_cy=26.0)
             new_geoms.append(g)
         gdf = gdf.set_geometry(new_geoms)
 
     return gdf
 
 
-# Continental-US bounding box used for all state heatmaps so the map fills the axes.
+# Continental-US bounding box used for all state heatmaps. Tuned so the AK/HI
+# insets (centered around y=26, x in [-124, -100]) fit comfortably.
 _US_MAP_XLIM = (-128, -65)
-_US_MAP_YLIM = (20, 52)
+_US_MAP_YLIM = (22, 52)
 
 
 def plot_us_state_heatmap(
