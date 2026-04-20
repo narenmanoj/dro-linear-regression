@@ -281,30 +281,36 @@ def main():
     dro.artifacts.save_solutions(run_dir, solutions)
     dro.artifacts.save_curves(run_dir, curves)
 
-    # US state heatmap (only when grouped by state on Folktables data).
+    # US state heatmaps (only when grouped by state on Folktables data).
+    # One PNG per solver, sharing a common color scale for direct comparison.
     if args.folktables and args.acs_group_by == "state":
         solver_to_state_losses = {}
         for label, x in solutions.items():
             losses = dro.group_losses(A_groups, b_groups, x)
             solver_to_state_losses[label] = dict(zip(group_names, losses))
 
-        import os as _os
-        plotting.plot_us_state_heatmaps_grid(
-            solver_to_state_losses,
-            shared_scale=True,
-            cbar_label="per-state MSE",
-            save_path=_os.path.join(run_dir, "state_heatmap_all.png"),
-        )
-        # Individual heatmaps for the key solvers.
-        for label in ("ERM", "OPT (CVXPY)", "Ball-Oracle (Lewis)"):
-            if label in solver_to_state_losses:
-                safe = label.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
-                plotting.plot_us_state_heatmap(
-                    solver_to_state_losses[label],
-                    title=f"Per-state MSE — {label}",
-                    cbar_label="MSE",
-                    save_path=_os.path.join(run_dir, f"state_heatmap_{safe}.png"),
-                )
+        # Shared vmin/vmax so color = same value across all heatmaps.
+        all_vals = [v for d in solver_to_state_losses.values() for v in d.values()]
+        vmin, vmax = min(all_vals), max(all_vals)
+
+        heatmap_dir = os.path.join(run_dir, "state_heatmaps")
+        os.makedirs(heatmap_dir, exist_ok=True)
+        # Load the GeoDataFrame once and reuse for every plot.
+        gdf_cache = plotting._load_us_states_gdf()
+
+        def _safe(s):
+            return (s.replace(" ", "_").replace("(", "").replace(")", "")
+                     .replace("/", "_"))
+
+        for label, state_losses in solver_to_state_losses.items():
+            plotting.plot_us_state_heatmap(
+                state_losses,
+                title=f"Per-state MSE — {label}",
+                vmin=vmin, vmax=vmax,
+                cbar_label="per-state MSE",
+                save_path=os.path.join(heatmap_dir, f"{_safe(label)}.png"),
+                _gdf=gdf_cache,
+            )
 
     # Config dump captures everything needed to reproduce the run.
     config_dump = {

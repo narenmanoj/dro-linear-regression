@@ -290,20 +290,25 @@ def _load_us_states_gdf(apply_insets: bool = True):
     gdf["abbr"] = gdf["name"].map(_STATE_NAME_TO_ABBR)
 
     if apply_insets:
+        # Target: AK as a scaled inset at the lower-left of the continental US,
+        # HI just below SoCal. Offsets below are in geographic degrees.
         new_geoms = []
         for _, row in gdf.iterrows():
             g = row.geometry
             if row["abbr"] == "AK":
-                # Scale down and shift to lower-left.
                 g = shp_scale(g, xfact=0.35, yfact=0.35, origin="center")
-                g = translate(g, xoff=-36, yoff=-33)
+                g = translate(g, xoff=32, yoff=-43)
             elif row["abbr"] == "HI":
-                # Shift to near SoCal.
-                g = translate(g, xoff=50, yoff=6)
+                g = translate(g, xoff=51, yoff=3)
             new_geoms.append(g)
         gdf = gdf.set_geometry(new_geoms)
 
     return gdf
+
+
+# Continental-US bounding box used for all state heatmaps so the map fills the axes.
+_US_MAP_XLIM = (-128, -65)
+_US_MAP_YLIM = (20, 52)
 
 
 def plot_us_state_heatmap(
@@ -315,6 +320,7 @@ def plot_us_state_heatmap(
     save_path: str | None = None,
     cbar_label: str = "per-state MSE",
     ax=None,
+    show_labels: bool = False,
     _gdf=None,
 ):
     """Render a geographically accurate US state choropleth (via geopandas).
@@ -323,13 +329,17 @@ def plot_us_state_heatmap(
     are light grey). Alaska and Hawaii are repositioned as insets near the
     continental US. Puerto Rico is skipped (not in the underlying GeoJSON).
 
+    Args:
+        show_labels: If True, overlay state abbreviation + value at each centroid.
+            Defaults False (unlabeled, cleaner for presentations).
+
     Requires: geopandas, shapely.
     """
     gdf = _gdf.copy() if _gdf is not None else _load_us_states_gdf()
     gdf["value"] = gdf["abbr"].map(state_to_value)
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(12, 7))
+        fig, ax = plt.subplots(figsize=(9, 5))
     else:
         fig = ax.figure
 
@@ -338,31 +348,33 @@ def plot_us_state_heatmap(
         cmap=cmap_name,
         vmin=vmin, vmax=vmax,
         ax=ax,
-        edgecolor="white", linewidth=0.5,
+        edgecolor="white", linewidth=0.3,
         legend=True,
-        legend_kwds={"label": cbar_label, "shrink": 0.6},
-        missing_kwds={"color": "lightgrey", "edgecolor": "white", "linewidth": 0.5},
+        legend_kwds={"label": cbar_label, "shrink": 0.7, "fraction": 0.035, "pad": 0.02},
+        missing_kwds={"color": "lightgrey", "edgecolor": "white", "linewidth": 0.3},
     )
 
-    # Label each state with abbreviation + value at centroid.
-    for _, row in gdf.iterrows():
-        if row.geometry is None or row.geometry.is_empty:
-            continue
-        c = row.geometry.centroid
-        val = row["value"]
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            label = row["abbr"]
-        else:
-            label = f"{row['abbr']}\n{val:.1f}"
-        ax.text(c.x, c.y, label, ha="center", va="center", fontsize=6)
+    if show_labels:
+        for _, row in gdf.iterrows():
+            if row.geometry is None or row.geometry.is_empty:
+                continue
+            c = row.geometry.centroid
+            val = row["value"]
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                label = row["abbr"]
+            else:
+                label = f"{row['abbr']}\n{val:.1f}"
+            ax.text(c.x, c.y, label, ha="center", va="center", fontsize=6)
 
+    ax.set_xlim(_US_MAP_XLIM)
+    ax.set_ylim(_US_MAP_YLIM)
     ax.set_aspect("equal")
     ax.set_axis_off()
-    ax.set_title(title)
+    ax.set_title(title, fontsize=13, pad=8)
     fig.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     return ax
 

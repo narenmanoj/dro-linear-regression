@@ -457,7 +457,8 @@ def main():
             log_scale=False,
         )
 
-        # US state heatmap — only when grouping by state on Folktables data.
+        # US state heatmaps — only when grouping by state on Folktables data.
+        # One PNG per (m, solver) with shared color scale.
         idx_sel = result.get("idx_selected")
         if (not args.synthetic and args.acs_group_by == "state"
                 and idx_sel is not None and "group_names" in info):
@@ -465,7 +466,6 @@ def main():
             A_sub = [A_groups_full[i] for i in idx_sel]
             b_sub = [b_groups_full[i] for i in idx_sel]
 
-            # Collect per-state losses for ERM, OPT, and each solver trajectory.
             solver_to_state_losses = {}
             if result.get("x_erm") is not None:
                 solver_to_state_losses["ERM"] = dict(zip(
@@ -483,12 +483,26 @@ def main():
                     dro.group_losses(A_sub, b_sub, traj.x_final),
                 ))
 
-            dro.plotting.plot_us_state_heatmaps_grid(
-                solver_to_state_losses,
-                shared_scale=True,
-                cbar_label="per-state MSE",
-                save_path=os.path.join(per_m_dir, f"state_heatmap_m{m}.png"),
-            )
+            all_vals = [v for d in solver_to_state_losses.values() for v in d.values()]
+            vmin_m, vmax_m = min(all_vals), max(all_vals)
+
+            heatmap_subdir = os.path.join(per_m_dir, f"state_heatmaps_m{m}")
+            os.makedirs(heatmap_subdir, exist_ok=True)
+            gdf_cache = dro.plotting._load_us_states_gdf()
+
+            def _safe(s):
+                return (s.replace(" ", "_").replace("(", "").replace(")", "")
+                         .replace("/", "_"))
+
+            for label, state_losses in solver_to_state_losses.items():
+                dro.plotting.plot_us_state_heatmap(
+                    state_losses,
+                    title=f"m={m}: per-state MSE — {label}",
+                    vmin=vmin_m, vmax=vmax_m,
+                    cbar_label="per-state MSE",
+                    save_path=os.path.join(heatmap_subdir, f"{_safe(label)}.png"),
+                    _gdf=gdf_cache,
+                )
 
     # Plots: m vs iterations, m vs time, with reference slopes.
     # Both log-log and linear-scale versions.
