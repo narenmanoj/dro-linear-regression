@@ -238,11 +238,187 @@ def plot_scaling(
 
 
 # ---------------------------------------------------------------------------
-# US state tile-grid heatmap
+# US state heatmaps
 # ---------------------------------------------------------------------------
 
-# Each state is placed at (row, col) in a tile grid approximating US geography.
-# Row 0 is top, col 0 is left. Gaps correspond to non-adjacent states.
+# Full state name -> 2-letter abbreviation (for matching GeoJSON "name" field).
+_STATE_NAME_TO_ABBR: dict[str, str] = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA", "Hawaii": "HI",
+    "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+    "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME",
+    "Maryland": "MD", "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN",
+    "Mississippi": "MS", "Missouri": "MO", "Montana": "MT", "Nebraska": "NE",
+    "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM",
+    "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
+    "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI",
+    "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX",
+    "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
+    "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+    "Puerto Rico": "PR",
+}
+
+_US_STATES_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/"
+    "data/geojson/us-states.json"
+)
+
+
+def _ensure_cached_us_states_geojson() -> str:
+    """Download and cache the US states GeoJSON on first use."""
+    import os
+    import urllib.request
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "dro-linear-regression")
+    cache_path = os.path.join(cache_dir, "us_states.geojson")
+    if not os.path.exists(cache_path):
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"Downloading US states GeoJSON to {cache_path} ...")
+        urllib.request.urlretrieve(_US_STATES_GEOJSON_URL, cache_path)
+    return cache_path
+
+
+def _load_us_states_gdf(apply_insets: bool = True):
+    """Load US states as a GeoDataFrame with abbreviations; optionally apply
+    Alaska/Hawaii insets (translate + scale to fit near continental US).
+    """
+    import geopandas as gpd
+    from shapely.affinity import translate, scale as shp_scale
+
+    gdf = gpd.read_file(_ensure_cached_us_states_geojson())
+    # The GeoJSON uses "name" with full state names.
+    gdf["abbr"] = gdf["name"].map(_STATE_NAME_TO_ABBR)
+
+    if apply_insets:
+        new_geoms = []
+        for _, row in gdf.iterrows():
+            g = row.geometry
+            if row["abbr"] == "AK":
+                # Scale down and shift to lower-left.
+                g = shp_scale(g, xfact=0.35, yfact=0.35, origin="center")
+                g = translate(g, xoff=-36, yoff=-33)
+            elif row["abbr"] == "HI":
+                # Shift to near SoCal.
+                g = translate(g, xoff=50, yoff=6)
+            new_geoms.append(g)
+        gdf = gdf.set_geometry(new_geoms)
+
+    return gdf
+
+
+def plot_us_state_heatmap(
+    state_to_value: dict[str, float],
+    title: str = "Per-state value",
+    cmap_name: str = "RdYlGn_r",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    save_path: str | None = None,
+    cbar_label: str = "per-state MSE",
+    ax=None,
+    _gdf=None,
+):
+    """Render a geographically accurate US state choropleth (via geopandas).
+
+    States are colored by their `state_to_value` entry (states missing a value
+    are light grey). Alaska and Hawaii are repositioned as insets near the
+    continental US. Puerto Rico is skipped (not in the underlying GeoJSON).
+
+    Requires: geopandas, shapely.
+    """
+    gdf = _gdf.copy() if _gdf is not None else _load_us_states_gdf()
+    gdf["value"] = gdf["abbr"].map(state_to_value)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 7))
+    else:
+        fig = ax.figure
+
+    gdf.plot(
+        column="value",
+        cmap=cmap_name,
+        vmin=vmin, vmax=vmax,
+        ax=ax,
+        edgecolor="white", linewidth=0.5,
+        legend=True,
+        legend_kwds={"label": cbar_label, "shrink": 0.6},
+        missing_kwds={"color": "lightgrey", "edgecolor": "white", "linewidth": 0.5},
+    )
+
+    # Label each state with abbreviation + value at centroid.
+    for _, row in gdf.iterrows():
+        if row.geometry is None or row.geometry.is_empty:
+            continue
+        c = row.geometry.centroid
+        val = row["value"]
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            label = row["abbr"]
+        else:
+            label = f"{row['abbr']}\n{val:.1f}"
+        ax.text(c.x, c.y, label, ha="center", va="center", fontsize=6)
+
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    ax.set_title(title)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+    return ax
+
+
+def plot_us_state_heatmaps_grid(
+    solver_to_state_values: dict[str, dict[str, float]],
+    title_prefix: str = "",
+    cmap_name: str = "RdYlGn_r",
+    shared_scale: bool = True,
+    cbar_label: str = "per-state MSE",
+    save_path: str | None = None,
+):
+    """Grid of US choropleths, one per solver. Shared colormap for direct comparison."""
+    labels = list(solver_to_state_values.keys())
+    n = len(labels)
+    if n == 0:
+        return
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    # Load the GeoDataFrame once; all subplots reuse it.
+    gdf = _load_us_states_gdf()
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4.2 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    if shared_scale:
+        all_vals = [v for d in solver_to_state_values.values() for v in d.values()]
+        vmin, vmax = min(all_vals), max(all_vals)
+    else:
+        vmin = vmax = None
+
+    for ax, label in zip(axes, labels):
+        plot_us_state_heatmap(
+            solver_to_state_values[label],
+            title=f"{title_prefix}{label}" if title_prefix else label,
+            cmap_name=cmap_name,
+            vmin=vmin, vmax=vmax,
+            cbar_label=cbar_label,
+            ax=ax,
+            _gdf=gdf,
+        )
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Tile-grid fallback (kept for offline use / as a simple alternative)
+# ---------------------------------------------------------------------------
+
 US_STATE_TILE_GRID: dict[str, tuple[int, int]] = {
     "AK": (0, 0), "ME": (0, 10),
     "VT": (1, 9), "NH": (1, 10),
@@ -261,7 +437,7 @@ US_STATE_TILE_GRID: dict[str, tuple[int, int]] = {
 }
 
 
-def plot_us_state_heatmap(
+def plot_us_state_heatmap_tile(
     state_to_value: dict[str, float],
     title: str = "Per-state value",
     cmap_name: str = "RdYlGn_r",
@@ -348,7 +524,7 @@ def plot_us_state_heatmap(
     return ax
 
 
-def plot_us_state_heatmaps_grid(
+def plot_us_state_heatmaps_grid_tile(
     solver_to_state_values: dict[str, dict[str, float]],
     title_prefix: str = "",
     cmap_name: str = "RdYlGn_r",
@@ -357,15 +533,7 @@ def plot_us_state_heatmaps_grid(
     label_fmt: str = "{:.1f}",
     save_path: str | None = None,
 ):
-    """Plot a grid of US tile-grid heatmaps, one per solver, with shared colormap.
-
-    Useful for comparing per-state losses under ERM, OPT, and each DRO method.
-
-    Args:
-        solver_to_state_values: {solver_label: {state_abbrev: value}}.
-        shared_scale: If True, all heatmaps use the same vmin/vmax so colors
-            are directly comparable across subplots.
-    """
+    """Tile-grid variant of plot_us_state_heatmaps_grid. No geopandas needed."""
     labels = list(solver_to_state_values.keys())
     n = len(labels)
     if n == 0:
@@ -385,7 +553,7 @@ def plot_us_state_heatmaps_grid(
         vmin = vmax = None
 
     for ax, label in zip(axes, labels):
-        plot_us_state_heatmap(
+        plot_us_state_heatmap_tile(
             solver_to_state_values[label],
             title=f"{title_prefix}{label}" if title_prefix else label,
             cmap_name=cmap_name,

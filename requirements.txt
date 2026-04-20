@@ -11,4 +11,9 @@ pandas>=2.0
 # Optional: ACS income dataset loader (dro.load_acs_income)
 folktables>=0.0.12
 
+# Optional: geographically accurate US state heatmap (plot_us_state_heatmap).
+# A tile-grid fallback (plot_us_state_heatmap_tile) is available without geopandas.
+geopandas>=1.0
+shapely>=2.0
+
 # Python >= 3.10 is required for PEP 604 union syntax (int | None) in type hints.
