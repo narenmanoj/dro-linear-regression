@@ -281,6 +281,31 @@ def main():
     dro.artifacts.save_solutions(run_dir, solutions)
     dro.artifacts.save_curves(run_dir, curves)
 
+    # US state heatmap (only when grouped by state on Folktables data).
+    if args.folktables and args.acs_group_by == "state":
+        solver_to_state_losses = {}
+        for label, x in solutions.items():
+            losses = dro.group_losses(A_groups, b_groups, x)
+            solver_to_state_losses[label] = dict(zip(group_names, losses))
+
+        import os as _os
+        plotting.plot_us_state_heatmaps_grid(
+            solver_to_state_losses,
+            shared_scale=True,
+            cbar_label="per-state MSE",
+            save_path=_os.path.join(run_dir, "state_heatmap_all.png"),
+        )
+        # Individual heatmaps for the key solvers.
+        for label in ("ERM", "OPT (CVXPY)", "Ball-Oracle (Lewis)"):
+            if label in solver_to_state_losses:
+                safe = label.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+                plotting.plot_us_state_heatmap(
+                    solver_to_state_losses[label],
+                    title=f"Per-state MSE — {label}",
+                    cbar_label="MSE",
+                    save_path=_os.path.join(run_dir, f"state_heatmap_{safe}.png"),
+                )
+
     # Config dump captures everything needed to reproduce the run.
     config_dump = {
         "cli_args": vars(args),

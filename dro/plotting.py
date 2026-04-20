@@ -237,6 +237,173 @@ def plot_scaling(
     plt.show()
 
 
+# ---------------------------------------------------------------------------
+# US state tile-grid heatmap
+# ---------------------------------------------------------------------------
+
+# Each state is placed at (row, col) in a tile grid approximating US geography.
+# Row 0 is top, col 0 is left. Gaps correspond to non-adjacent states.
+US_STATE_TILE_GRID: dict[str, tuple[int, int]] = {
+    "AK": (0, 0), "ME": (0, 10),
+    "VT": (1, 9), "NH": (1, 10),
+    "WA": (2, 1), "MT": (2, 2), "ND": (2, 3), "MN": (2, 4), "WI": (2, 5),
+    "MI": (2, 7), "NY": (2, 8), "MA": (2, 9), "RI": (2, 10),
+    "OR": (3, 1), "ID": (3, 2), "SD": (3, 3), "IA": (3, 4), "IL": (3, 5),
+    "IN": (3, 6), "OH": (3, 7), "PA": (3, 8), "NJ": (3, 9), "CT": (3, 10),
+    "CA": (4, 1), "NV": (4, 2), "WY": (4, 3), "NE": (4, 4), "MO": (4, 5),
+    "KY": (4, 6), "WV": (4, 7), "VA": (4, 8), "MD": (4, 9), "DE": (4, 10),
+    "UT": (5, 2), "CO": (5, 3), "KS": (5, 4), "AR": (5, 5), "TN": (5, 6),
+    "NC": (5, 7), "SC": (5, 8), "DC": (5, 9),
+    "AZ": (6, 2), "NM": (6, 3), "OK": (6, 4), "LA": (6, 5), "MS": (6, 6),
+    "AL": (6, 7), "GA": (6, 8),
+    "HI": (7, 0), "TX": (7, 4), "FL": (7, 8),
+    "PR": (8, 9),
+}
+
+
+def plot_us_state_heatmap(
+    state_to_value: dict[str, float],
+    title: str = "Per-state value",
+    cmap_name: str = "RdYlGn_r",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    save_path: str | None = None,
+    label_fmt: str = "{:.1f}",
+    cbar_label: str = "loss",
+    ax=None,
+):
+    """Render a US-state tile-grid heatmap. States are colored by their value;
+    states with no value are shown in light grey.
+
+    Args:
+        state_to_value: {state_abbrev: numeric value}.
+        cmap_name: Matplotlib colormap (default: red-yellow-green reversed so
+            small = green = good, large = red = bad).
+        vmin, vmax: Color scale limits. If None, inferred from data.
+        label_fmt: Format string for the in-tile numeric label.
+        cbar_label: Colorbar label.
+        ax: Optional existing Axes to draw into.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.cm as mcm
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+    else:
+        fig = ax.figure
+
+    values = list(state_to_value.values())
+    if not values:
+        ax.set_title(title + " (no data)")
+        return ax
+    if vmin is None:
+        vmin = min(values)
+    if vmax is None:
+        vmax = max(values)
+
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = mcm.get_cmap(cmap_name)
+
+    max_row = max(r for r, _ in US_STATE_TILE_GRID.values())
+    max_col = max(c for _, c in US_STATE_TILE_GRID.values())
+
+    for abbr, (r, c) in US_STATE_TILE_GRID.items():
+        val = state_to_value.get(abbr)
+        y = max_row - r  # invert so row 0 appears at top
+
+        if val is None:
+            color = "lightgrey"
+            text_color = "dimgrey"
+            label = abbr
+        else:
+            rgba = cmap(norm(val))
+            color = rgba
+            lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+            text_color = "white" if lum < 0.5 else "black"
+            label = f"{abbr}\n{label_fmt.format(val)}"
+
+        ax.add_patch(plt.Rectangle((c, y), 1, 1,
+                                    facecolor=color,
+                                    edgecolor="white", linewidth=1.5))
+        ax.text(c + 0.5, y + 0.5, label,
+                ha="center", va="center", fontsize=7, color=text_color)
+
+    ax.set_xlim(-0.3, max_col + 1.3)
+    ax.set_ylim(-0.3, max_row + 1.3)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(title)
+
+    sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, shrink=0.6, label=cbar_label)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+    return ax
+
+
+def plot_us_state_heatmaps_grid(
+    solver_to_state_values: dict[str, dict[str, float]],
+    title_prefix: str = "",
+    cmap_name: str = "RdYlGn_r",
+    shared_scale: bool = True,
+    cbar_label: str = "per-state loss",
+    label_fmt: str = "{:.1f}",
+    save_path: str | None = None,
+):
+    """Plot a grid of US tile-grid heatmaps, one per solver, with shared colormap.
+
+    Useful for comparing per-state losses under ERM, OPT, and each DRO method.
+
+    Args:
+        solver_to_state_values: {solver_label: {state_abbrev: value}}.
+        shared_scale: If True, all heatmaps use the same vmin/vmax so colors
+            are directly comparable across subplots.
+    """
+    labels = list(solver_to_state_values.keys())
+    n = len(labels)
+    if n == 0:
+        return
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3.5 * nrows))
+    if n == 1:
+        axes = np.array([axes])
+    axes = np.atleast_1d(axes).flatten()
+
+    if shared_scale:
+        all_vals = [v for d in solver_to_state_values.values() for v in d.values()]
+        vmin, vmax = min(all_vals), max(all_vals)
+    else:
+        vmin = vmax = None
+
+    for ax, label in zip(axes, labels):
+        plot_us_state_heatmap(
+            solver_to_state_values[label],
+            title=f"{title_prefix}{label}" if title_prefix else label,
+            cmap_name=cmap_name,
+            vmin=vmin, vmax=vmax,
+            label_fmt=label_fmt,
+            cbar_label=cbar_label,
+            ax=ax,
+        )
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+
+
 def plot_interpolation_path(
     path: list[dict],
     F_opt: float | None = None,
