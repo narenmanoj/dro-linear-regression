@@ -50,8 +50,11 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--acs-all", action="store_true",
                     help="Use all 51 regions (~2400 PUMAs nationally).")
     p.add_argument("--acs-year", type=str, default="2018")
+    p.add_argument("--acs-group-by", choices=["state", "race", "puma", "state_race"],
+                    default="puma",
+                    help="Grouping key for ACS data (default: puma, for thousands of groups).")
     p.add_argument("--samples-per-puma", type=int, default=50,
-                    help="Fixed samples per PUMA (subsample within each group).")
+                    help="Fixed samples per group (subsample within each group).")
 
     # Synthetic-instance options.
     p.add_argument("--syn-pool-m", type=int, default=2500,
@@ -248,15 +251,15 @@ def main():
         else:
             states = args.acs_states
 
-        print(f"Loading ACS data for states: {states} ...")
+        print(f"Loading ACS data for states: {states}, group_by={args.acs_group_by} ...")
         A_groups_full, b_groups_full, info = dro.load_acs_income(
             states=states,
             survey_year=args.acs_year,
-            group_by="puma",
+            group_by=args.acs_group_by,
             subsample=args.samples_per_puma,
             min_group_size=args.samples_per_puma,
         )
-        info["source"] = "folktables_puma"
+        info["source"] = f"folktables_{args.acs_group_by}"
 
     print(f"  Pool: {info['n_groups']} groups, d={info['d']}, "
           f"n_total={info['n_total']}")
