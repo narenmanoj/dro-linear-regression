@@ -139,6 +139,7 @@ def run_one_size(
     """Run all solvers on a random subset of m groups. Returns per-solver stats."""
     # Subsample groups (without replacement).
     idx = rng.choice(len(A_groups_full), size=m, replace=False)
+    idx_list = [int(i) for i in idx]
     A_groups = [A_groups_full[i] for i in idx]
     b_groups = [b_groups_full[i] for i in idx]
 
@@ -161,9 +162,11 @@ def run_one_size(
     try:
         opt = solvers.solve_exact(A_groups, b_groups)
         F_opt = opt.best_loss
+        x_opt = opt.x_final
     except Exception as e:
         print(f"    [CVXPY failed at m={m}: {e}]")
-        return {"m": m, "F_erm": F_erm, "F_opt": None, "n_stats": n_stats, "solvers": {}}
+        return {"m": m, "F_erm": F_erm, "F_opt": None, "n_stats": n_stats,
+                "idx_selected": idx_list, "solvers": {}}
 
     # Smoothing parameters: follow Algorithm 1 line 5 of the paper, scaled so
     # the smoothed objective is accurate to within the target additive error.
@@ -223,6 +226,9 @@ def run_one_size(
         "F_erm": float(F_erm),
         "F_opt": float(F_opt),
         "n_stats": n_stats,
+        "idx_selected": idx_list,
+        "x_erm": x0,
+        "x_opt": x_opt,
         "solvers": results,
         "trajectories": trajectories,
     }
@@ -337,8 +343,12 @@ def main():
             "F_opt": float(np.median([t["F_opt"] for t in trials if t["F_opt"] is not None])),
             "n_stats": n_stats_agg,
             "solvers": solvers_agg,
-            # Keep trial 0's trajectories for the per-m plots (not serialized to JSON).
+            # Keep trial 0's trajectories, chosen group indices, and ERM/OPT solutions
+            # for per-m plots and heatmaps. Not serialized to JSON.
             "trajectories": trials[0].get("trajectories", {}),
+            "idx_selected": trials[0].get("idx_selected"),
+            "x_erm": trials[0].get("x_erm"),
+            "x_opt": trials[0].get("x_opt"),
         }
 
         n = n_stats_agg
@@ -446,6 +456,39 @@ def main():
             save_path=os.path.join(per_m_dir, f"time_m{m}_linear.png"),
             log_scale=False,
         )
+
+        # US state heatmap — only when grouping by state on Folktables data.
+        idx_sel = result.get("idx_selected")
+        if (not args.synthetic and args.acs_group_by == "state"
+                and idx_sel is not None and "group_names" in info):
+            group_names_sub = [info["group_names"][i] for i in idx_sel]
+            A_sub = [A_groups_full[i] for i in idx_sel]
+            b_sub = [b_groups_full[i] for i in idx_sel]
+
+            # Collect per-state losses for ERM, OPT, and each solver trajectory.
+            solver_to_state_losses = {}
+            if result.get("x_erm") is not None:
+                solver_to_state_losses["ERM"] = dict(zip(
+                    group_names_sub,
+                    dro.group_losses(A_sub, b_sub, result["x_erm"]),
+                ))
+            if result.get("x_opt") is not None:
+                solver_to_state_losses["OPT"] = dict(zip(
+                    group_names_sub,
+                    dro.group_losses(A_sub, b_sub, result["x_opt"]),
+                ))
+            for label, traj in curves.items():
+                solver_to_state_losses[label] = dict(zip(
+                    group_names_sub,
+                    dro.group_losses(A_sub, b_sub, traj.x_final),
+                ))
+
+            dro.plotting.plot_us_state_heatmaps_grid(
+                solver_to_state_losses,
+                shared_scale=True,
+                cbar_label="per-state MSE",
+                save_path=os.path.join(per_m_dir, f"state_heatmap_m{m}.png"),
+            )
 
     # Plots: m vs iterations, m vs time, with reference slopes.
     # Both log-log and linear-scale versions.
