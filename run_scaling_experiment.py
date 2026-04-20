@@ -144,6 +144,16 @@ def run_one_size(
 
     d = A_groups[0].shape[1]
 
+    # Per-group sample counts for diagnostics.
+    n_per_group = np.array([A.shape[0] for A in A_groups])
+    n_stats = {
+        "min": int(n_per_group.min()),
+        "max": int(n_per_group.max()),
+        "median": float(np.median(n_per_group)),
+        "mean": float(n_per_group.mean()),
+        "total": int(n_per_group.sum()),
+    }
+
     # Baselines.
     x0 = dro.erm_solution(A_groups, b_groups)
     F_erm = dro.max_group_loss(A_groups, b_groups, x0)
@@ -153,7 +163,7 @@ def run_one_size(
         F_opt = opt.best_loss
     except Exception as e:
         print(f"    [CVXPY failed at m={m}: {e}]")
-        return {"m": m, "F_erm": F_erm, "F_opt": None, "solvers": {}}
+        return {"m": m, "F_erm": F_erm, "F_opt": None, "n_stats": n_stats, "solvers": {}}
 
     # Smoothing parameters: follow Algorithm 1 line 5 of the paper, scaled so
     # the smoothed objective is accurate to within the target additive error.
@@ -212,6 +222,7 @@ def run_one_size(
         "m": m,
         "F_erm": float(F_erm),
         "F_opt": float(F_opt),
+        "n_stats": n_stats,
         "solvers": results,
         "trajectories": trajectories,
     }
@@ -310,17 +321,30 @@ def main():
                 "n_trials": args.n_trials,
             }
 
+        # Aggregate per-group sample stats across trials.
+        ns_all = [t["n_stats"] for t in trials if "n_stats" in t]
+        n_stats_agg = {
+            "min": int(np.min([s["min"] for s in ns_all])),
+            "max": int(np.max([s["max"] for s in ns_all])),
+            "median": float(np.median([s["median"] for s in ns_all])),
+            "mean": float(np.mean([s["mean"] for s in ns_all])),
+            "total": int(np.median([s["total"] for s in ns_all])),
+        } if ns_all else {}
+
         result = {
             "m": m,
             "F_erm": float(np.median([t["F_erm"] for t in trials])),
             "F_opt": float(np.median([t["F_opt"] for t in trials if t["F_opt"] is not None])),
+            "n_stats": n_stats_agg,
             "solvers": solvers_agg,
             # Keep trial 0's trajectories for the per-m plots (not serialized to JSON).
             "trajectories": trials[0].get("trajectories", {}),
         }
 
+        n = n_stats_agg
+        ns_str = f"n/group∈[{n['min']},{n['max']}] med={n['median']:.0f} total≈{n['total']}" if n else ""
         print(f"  [total {time.perf_counter() - t0:.1f}s, "
-              f"F_erm={result['F_erm']:.4f}, F_opt={result['F_opt']:.4f}]")
+              f"F_erm={result['F_erm']:.4f}, F_opt={result['F_opt']:.4f}, {ns_str}]")
         for solver_name, stats in result["solvers"].items():
             its = stats["iters_to_target"]
             tms = stats["time_to_target"]
@@ -352,9 +376,13 @@ def main():
     import csv
     with open(os.path.join(run_dir, "scaling.csv"), "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["m", "solver", "iters_to_target_median", "time_to_target_s_median",
-                          "n_trials_succeeded", "n_trials", "F_erm_median", "F_opt_median"])
+        writer.writerow([
+            "m", "solver", "iters_to_target_median", "time_to_target_s_median",
+            "n_trials_succeeded", "n_trials", "F_erm_median", "F_opt_median",
+            "n_per_group_min", "n_per_group_max", "n_per_group_median", "n_total",
+        ])
         for result in sweep_results:
+            ns = result.get("n_stats", {})
             for solver, stats in result["solvers"].items():
                 writer.writerow([
                     result["m"], solver,
@@ -364,6 +392,8 @@ def main():
                     stats["n_trials"],
                     f"{result['F_erm']:.6f}",
                     f"{result['F_opt']:.6f}" if result['F_opt'] else "",
+                    ns.get("min", ""), ns.get("max", ""),
+                    ns.get("median", ""), ns.get("total", ""),
                 ])
 
     # Config dump.
